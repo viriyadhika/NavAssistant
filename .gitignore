@@ -3,3 +3,5 @@ data
 .DS_Store
 .mypy_cache
 vggt
+.venv_vggt
+.vscode
