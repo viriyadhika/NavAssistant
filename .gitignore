@@ -5,3 +5,4 @@ data
 vggt
 .venv_vggt
 .vscode
+__pycache__
