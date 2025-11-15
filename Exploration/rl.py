@@ -189,12 +189,71 @@ from collections import deque
 from PIL import Image
 import clip
 
+class CLIPLongTermNovelty:
+    def __init__(self, device=DEVICE, model_name="ViT-B/32",
+                 ep_buf_size=EPISODE_STEPS, lt_buf_size=4096, topk=10, tau=0.75,
+                 alpha=1.0, beta=0.1, scale=5.0):
+        self.device = device
+        self.model, self.preprocess = clip.load(model_name, device=device)
+        self.ep_buf = deque(maxlen=ep_buf_size)                # episodic (cleared each episode)
+        self.lt_buf = deque(maxlen=lt_buf_size)                # long-term (persistent)
+        self.topk = topk
+        self.tau = tau      # margin for penalty
+        self.alpha = alpha  # weight for episodic novelty
+        self.beta = beta    # weight for long-term penalty
+
+    @torch.no_grad()
+    def _encode(self, frame_np):
+        img = Image.fromarray(frame_np)
+        x = self.preprocess(img).unsqueeze(0).to(self.device)
+        z = self.model.encode_image(x)
+        z = z / z.norm(dim=-1, keepdim=True)
+        return z.float()  # (1,D)
+
+    @staticmethod
+    def _topk_sim(feat, mem, k):
+        mem_t = torch.cat(list(mem), dim=0)  # (N,D)
+        sims = (feat @ mem_t.T).squeeze(0)  # (N,)
+        k = min(k, sims.numel())
+        return torch.topk(sims, k, largest=True).values.mean().item()
+
+    def compute_reward(self, frame_np):
+        feat = self._encode(frame_np)
+
+        if len(self.ep_buf) == 0:
+            self.ep_buf.append(feat.detach())
+            self.lt_buf.append(feat.detach())
+            return 0.0
+
+        # Episodic novelty (encourage low similarity to current-episode frames)
+        ep_sim = self._topk_sim(feat, self.ep_buf, self.topk)   # ~0.8–0.99
+        ep_novelty = 1.0 - ep_sim                               # small (0.01–0.2)
+        ep_term = self.alpha * (max(0, ep_novelty) ** 0.5)              # non-linear boost
+
+        # Long-term repetition penalty (discourage re-visiting prior episodes)
+        lt_sim = self._topk_sim(feat, self.lt_buf, self.topk)
+        # Linear margin: no penalty below tau
+        lt_pen = max(0.0, (lt_sim - self.tau) / (1 - self.tau))
+        lt_term = self.beta * lt_pen
+
+        reward = ep_term - lt_term
+
+        self.ep_buf.append(feat.detach())
+        self.lt_buf.append(feat.detach())
+
+        return float(reward)
+
+    def reset(self):
+        # Clear only episodic memory
+        self.ep_buf.clear()
+        # self.lt_buf persists across episodes
+
+
 class CLIPNovelty:
     """
-    Computes intrinsic reward = 1 - top-k cosine similarity
-    between current CLIP embedding and recent embeddings.
-    Encourages exploration by penalizing views similar to
-    the k most similar past frames instead of the mean.
+    Intrinsic reward based on CLIP embedding novelty.
+    Computes reward = β * (1 - mean(top-k cosine similarity))
+    with exponential smoothing for stability.
     """
     def __init__(
         self,
@@ -202,13 +261,15 @@ class CLIPNovelty:
         model_name="ViT-B/32",
         buffer_size=EPISODE_STEPS,
         topk=5,
-        tau=0.95
+        tau=0.95,         # smoothing factor
     ):
         self.device = device
         self.model, self.preprocess = clip.load(model_name, device=device)
         self.buffer = deque(maxlen=buffer_size)
         self.buffer_size = buffer_size
         self.topk = topk
+        self.tau = tau
+        self.running_reward = 0.0  # EMA baseline
 
     @torch.no_grad()
     def compute_reward(self, frame_np):
@@ -218,34 +279,37 @@ class CLIPNovelty:
         """
         img = Image.fromarray(frame_np)
         img_t = self.preprocess(img).unsqueeze(0).to(self.device)
-        emb = self.model.encode_image(img_t)
-        emb = emb / emb.norm(dim=-1, keepdim=True)  # normalize to unit sphere
 
-        # if no past embeddings, no novelty signal yet
+        # 1) Encode and normalize embedding
+        emb = self.model.encode_image(img_t)
+        emb = emb / emb.norm(dim=-1, keepdim=True)
+
+        # 2) If no past, no novelty yet
         if len(self.buffer) == 0:
             self.buffer.append(emb)
             return 0.0
 
-        # stack buffer to tensor once per step
+        # 3) Compute cosine similarities
         past = torch.cat(list(self.buffer), dim=0)  # (N, D)
-
-        # cosine similarity with all past embeddings
-        sims = (emb @ past.T).squeeze(0)  # (N,)
-
-        # compute top-k most similar embeddings
+        sims = (emb @ past.T).squeeze(0)            # (N,)
         k = min(self.topk, sims.size(0))
         topk_sim = torch.topk(sims, k, largest=True).values.mean().item()
 
-        # final reward encourages novelty (lower similarity)
-        reward = 1.0 - topk_sim
+        # 4) Novelty reward (larger when less similar)
+        reward_raw = 1.0 - topk_sim
 
-        # update buffer
+        # 5) Smooth reward with EMA to reduce noise
+        self.running_reward = self.tau * self.running_reward + (1 - self.tau) * reward_raw
+        reward = reward_raw - self.running_reward   # "relative novelty"
+
+        # 6) Update buffer
         self.buffer.append(emb.detach())
 
         return float(reward)
 
     def reset(self):
         self.buffer.clear()
+        self.running_reward = 0.0
 
 class ClipEnv(Env):
     def __init__(self, clip_novelty: CLIPNovelty):
@@ -317,23 +381,31 @@ class PPO():
 
 
     @torch.no_grad()
-    def act_and_value(self, obs_seq, actor_critic: ActorCritic):  # obs_seq: (1, seq_len, 3, H, W)
-        # Encode each frame individually    
-        feats = actor_critic.actor_critic_encoder(obs_seq)             # (B, seq_len, FEAT_DIM)
+    def act_and_value(self, obs_seq, actions_seq, actor_critic: ActorCritic):
+        """
+        obs_seq:     (1, seq_len, 3, H, W)
+        actions_seq: (1, seq_len)  -- previous actions (use 0 for the first)
+        returns:
+            logits: (num_actions,)  -- policy for the *next* action
+            value:  scalar          -- critic estimate for current state
+        """
+        # Encode visual observations
+        feats = actor_critic.actor_critic_encoder(obs_seq)  # (1, seq_len, feat_dim)
 
-        # Actor: uses sequence
-        logits = actor_critic.actor(feats, None)[-1, :]                # (B, s, NUM_ACTIONS)
-        value = actor_critic.critic(feats, None)[-1, :]      
+        # Feed both vision + actions to actor and critic
+        logits_seq = actor_critic.actor(feats, actions_seq, mask=None)  # (1*seq_len, num_actions)
+        value_seq  = actor_critic.critic(feats, mask=None)              # (1*seq_len, 1)
 
+        # Get only the *last* timestep (the most recent frame)
+        logits = logits_seq[-1, :]          # (num_actions,)
+        value  = value_seq[-1, :].item()    # scalar
 
-        # Critic: only use last frame (current state)
-                       # (B, 1)
-        return logits, value.item()
+        return logits, value
 
     def evaluate_batch(self, obs: torch.Tensor, actions, actor_critic: ActorCritic):
         """
         obs:     (B, S, 3, H, W)
-        actions: (B*S,)
+        actions: (B*S,)  flattened actions
         returns:
             logps:      (B*S,)
             entropies:  (B*S,)
@@ -342,18 +414,22 @@ class PPO():
         b, s, c, h, w = obs.shape
         feats = actor_critic.actor_critic_encoder(obs)  # (B, S, D)
 
-        # 3) Transformer over full sequence with causal mask
-
+        # Causal mask (upper triangular)
         causal_mask = torch.full((s, s), float('-inf'), device=feats.device)
         causal_mask = torch.triu(causal_mask, diagonal=1)
 
-        logits = actor_critic.actor(feats, causal_mask)
+        # ---- [1] reshape actions and shift ----
+        actions = actions.view(b, s)  # reshape from (B*S,) -> (B, S)
+        actions_seq = torch.cat([torch.zeros_like(actions[:, :1]), actions[:, :-1]], dim=1)  # prev actions
+
+        # ---- [2] actor forward ----
+        logits = actor_critic.actor(feats, actions_seq, causal_mask)  # (B*S, num_actions)
         dist = torch.distributions.Categorical(logits=logits)
 
-        logps     = dist.log_prob(actions)                      # (B*S,)
-        entropies = dist.entropy()                              # (B*S,)
-        # 6) Value per prefix: use last-state representation at each prefix (z at time t)
-        values = actor_critic.critic(feats, causal_mask).squeeze(-1)            # (B*S,)
+        # ---- [3] log-probs, entropy, and critic ----
+        logps = dist.log_prob(actions.view(-1))      # flatten again (B*S,)
+        entropies = dist.entropy()                   # (B*S,)
+        values = actor_critic.critic(feats, causal_mask).squeeze(-1)  # (B*S,)
 
         return logps, entropies, values
     

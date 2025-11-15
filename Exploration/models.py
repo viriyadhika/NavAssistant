@@ -132,19 +132,42 @@ class FrozenCLIPEncoder(nn.Module):
 class Actor(nn.Module):
     def __init__(self, feat_dim, num_actions, n_layers=2, n_heads=8, max_len=EPISODE_STEPS):
         super().__init__()
+        self.feat_dim = feat_dim
+        self.num_actions = num_actions
+
+        # Positional embedding for temporal order
         self.pos_embed = nn.Parameter(torch.zeros(1, max_len, feat_dim))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        # Action embedding (one vector per discrete action)
+        self.action_embed = nn.Embedding(num_actions, feat_dim)
+
+        # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=feat_dim, nhead=n_heads, dim_feedforward=4*feat_dim, batch_first=True
+            d_model=feat_dim, nhead=n_heads, dim_feedforward=4 * feat_dim, batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        # Policy head
         self.policy_head = nn.Linear(feat_dim, num_actions)
 
-    def forward(self, feats_seq, mask):
-        # feats_seq: (B, seq_len, feat_dim)
+    def forward(self, feats_seq, actions_seq, mask=None):
+        """
+        feats_seq: (B, S, feat_dim)
+        actions_seq: (B, S)  -- discrete action indices (use 0 for first timestep)
+        mask: optional transformer mask
+        """
         b, s, _ = feats_seq.shape
-        feats_seq = feats_seq + self.pos_embed[:,:s,:]
-        z = self.transformer(feats_seq, mask).view(b*s, -1)  # (B*seq_len, feat_dim)
+        feats_seq = feats_seq + self.pos_embed[:, :s, :]
+
+        # Embed actions and fuse with features
+        action_emb = self.action_embed(actions_seq)  # (B, S, feat_dim)
+        fused = feats_seq + action_emb               # elementwise fusion
+
+        # Transformer
+        z = self.transformer(fused, mask).view(b * s, -1)
+
+        # Policy logits
         logits = self.policy_head(z)
         return logits
 
