@@ -183,16 +183,32 @@ class RNDIntrinsicEnv(Env):
         pass
 
 
+import torch
+import torch.nn.functional as F
+from collections import deque
+from PIL import Image
+import clip
+
 class CLIPNovelty:
     """
-    Computes intrinsic reward = 1 - mean cosine similarity
-    between current CLIP embedding and last N embeddings.
+    Computes intrinsic reward = 1 - top-k cosine similarity
+    between current CLIP embedding and recent embeddings.
+    Encourages exploration by penalizing views similar to
+    the k most similar past frames instead of the mean.
     """
-    def __init__(self, device=DEVICE, model_name="ViT-B/32", buffer_size=EPISODE_STEPS):
+    def __init__(
+        self,
+        device=DEVICE,
+        model_name="ViT-B/32",
+        buffer_size=EPISODE_STEPS,
+        topk=5,
+        tau=0.95
+    ):
         self.device = device
         self.model, self.preprocess = clip.load(model_name, device=device)
         self.buffer = deque(maxlen=buffer_size)
         self.buffer_size = buffer_size
+        self.topk = topk
 
     @torch.no_grad()
     def compute_reward(self, frame_np):
@@ -205,26 +221,37 @@ class CLIPNovelty:
         emb = self.model.encode_image(img_t)
         emb = emb / emb.norm(dim=-1, keepdim=True)  # normalize to unit sphere
 
+        # if no past embeddings, no novelty signal yet
         if len(self.buffer) == 0:
             self.buffer.append(emb)
-            return 0.0  # no past frames to compare yet
+            return 0.0
 
+        # stack buffer to tensor once per step
         past = torch.cat(list(self.buffer), dim=0)  # (N, D)
-        sim = F.cosine_similarity(emb, past)        # (N,)
-        reward = (1 - sim.mean()).item()
-        self.buffer.append(emb)
-        return reward
-    
+
+        # cosine similarity with all past embeddings
+        sims = (emb @ past.T).squeeze(0)  # (N,)
+
+        # compute top-k most similar embeddings
+        k = min(self.topk, sims.size(0))
+        topk_sim = torch.topk(sims, k, largest=True).values.mean().item()
+
+        # final reward encourages novelty (lower similarity)
+        reward = 1.0 - topk_sim
+
+        # update buffer
+        self.buffer.append(emb.detach())
+
+        return float(reward)
+
     def reset(self):
-        self.buffer = deque(maxlen=self.buffer_size)
+        self.buffer.clear()
 
 class ClipEnv(Env):
     def __init__(self, clip_novelty: CLIPNovelty):
         super().__init__()
         self.clip_novelty = clip_novelty
         self.positions = deque(maxlen=16)
-        self.undo_count = 0
-        self.last_action = ""
         
     def step_env(self, controller, action_idx):
         action_str = ACTIONS[action_idx]
@@ -236,16 +263,11 @@ class ClipEnv(Env):
         avg_pos = np.mean(np.stack(self.positions), axis=0)
 
         # --- Small bonus for moving away from recent average ---
-        pos_bonus = np.linalg.norm(pos - avg_pos) / 8  # ~0–0.1 scale
-        fail_penalty = 0 if event.metadata["lastActionSuccess"] else -0.1
-        if "Rotate" in self.last_action and "Rotate" in action_str and self.last_action != action_str:
-            self.undo_count += 1
-        else:
-            self.undo_count = max(0, self.undo_count - 0.5)
-        undo_penalty = -0.05 * self.undo_count
+        pos_bonus = np.linalg.norm(pos - avg_pos) / 2  # ~0–0.1 scale
+        fail_penalty = 0 if event.metadata["lastActionSuccess"] else -0.2
         self.last_action = action_str
 
-        return event, reward + pos_bonus + fail_penalty + undo_penalty
+        return event, 5 * reward + pos_bonus + fail_penalty
     
     def reset(self):
         self.clip_novelty.reset()
