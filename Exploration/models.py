@@ -140,7 +140,7 @@ class Actor(nn.Module):
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
         # Action embedding (one vector per discrete action)
-        self.action_embed = nn.Embedding(num_actions, feat_dim)
+        self.action_embed = nn.Embedding(num_actions + 1, feat_dim)
 
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
