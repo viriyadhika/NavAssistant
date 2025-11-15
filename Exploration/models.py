@@ -13,31 +13,40 @@ from cons import IMG_SIZE, FEAT_DIM, EPISODE_STEPS, DEVICE
 
 class FrozenResNetEncoder(nn.Module):
     """
-    Frozen pretrained ResNet encoder that outputs (B, S, feat_dim),
-    identical to CNNEncoder's output shape.
+    Frozen pretrained ResNet encoder that outputs (B, S, feat_dim)
+    but processes frames in chunks to avoid GPU OOM.
     """
-    def __init__(self, feat_dim: int = FEAT_DIM, device: str = DEVICE):
+    def __init__(self, feat_dim: int = FEAT_DIM, device: str = DEVICE, chunk_size: int = 32):
         super().__init__()
-        # Use a small ResNet backbone
+
+        # Use small ResNet backbone
         resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
 
-        # Remove classification head (keep up to global avgpool)
+        # Remove classification head
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])  # -> (B, 512, 1, 1)
-        self.backbone.eval()  # important: freeze batchnorm behavior
+        self.backbone.eval()  
 
-        # Freeze all backbone parameters
+        # Freeze everything
         for p in self.backbone.parameters():
             p.requires_grad = False
 
-        # Save output dimension of resnet conv feature
-        self.backbone_out_dim = resnet.fc.in_features  # typically 512
-
-        # Small projection layer to match CNN's feat_dim
+        self.backbone_out_dim = resnet.fc.in_features  # 512
         self.proj = nn.Linear(self.backbone_out_dim, feat_dim)
-        self.feat_dim = feat_dim
 
+        self.feat_dim = feat_dim
+        self.chunk_size = chunk_size
         self.device = device
         self.to(device)
+
+        # Precompute normalization tensors
+        self.register_buffer(
+            "mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1)
+        )
+        self.register_buffer(
+            "std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -45,21 +54,30 @@ class FrozenResNetEncoder(nn.Module):
         returns: (B, S, feat_dim)
         """
         b, s, c, h, w = x.shape
-        x = x.reshape(b * s, c, h, w).to(self.device)
+        x = x.reshape(b * s, c, h, w)  # flatten sequence dimension
 
-        # Normalize to match ImageNet statistics
-        # Expected input range: [0,1]
-        mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1,3,1,1)
-        std  = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1,3,1,1)
-        x = (x - mean) / std
+        feats_list = []
 
-        with torch.no_grad():  # frozen backbone
-            feats = self.backbone(x)        # (B*S, 512, 1, 1)
-            feats = feats.flatten(1)        # (B*S, 512)
+        # Process in chunks to avoid OOM
+        for i in range(0, b * s, self.chunk_size):
+            chunk = x[i:i + self.chunk_size].to(self.device)
 
-        z = self.proj(feats)                # (B*S, feat_dim)
-        z = z.view(b, s, self.feat_dim)     # reshape to (B, S, D)
-        return z
+            # Normalize for ResNet
+            chunk = (chunk - self.mean) / self.std
+
+            with torch.no_grad():
+                f = self.backbone(chunk)    # (chunk, 512, 1, 1)
+                f = f.flatten(1)            # (chunk, 512)
+
+            # Project to feat_dim
+            f = self.proj(f)                # (chunk, feat_dim)
+            feats_list.append(f)
+
+        # Concat chunk outputs
+        feats = torch.cat(feats_list, dim=0)    # (B*S, feat_dim)
+
+        # Restore original shape
+        return feats.view(b, s, self.feat_dim)
     
 class FrozenCLIPEncoder(nn.Module):
     """

@@ -25,9 +25,9 @@ class RolloutBuffer:
 
 class ActorCritic():
     def __init__(self, encoder: nn.Module, actor: nn.Module, critic: nn.Module):
-        self.actor_critic_encoder = encoder
-        self.actor   = actor
-        self.critic  = critic
+        self.actor_critic_encoder = encoder.to(DEVICE)
+        self.actor   = actor.to(DEVICE)
+        self.critic  = critic.to(DEVICE)
         self.optimizer = torch.optim.AdamW(
             list(self.actor_critic_encoder.parameters()) + list(self.actor.parameters()) + list(self.critic.parameters()),
             lr=LR
