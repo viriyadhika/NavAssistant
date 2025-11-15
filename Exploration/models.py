@@ -149,3 +149,54 @@ class Critic(nn.Module):
         z = self.transformer(feats_seq, mask).view(b*s, -1)  # (B*seq_len, feat_dim)
         logits = self.policy_head(z)
         return logits
+
+
+class LSTMActor(nn.Module):
+    def __init__(self, feat_dim: int, num_actions: int):
+        super().__init__()
+        self.num_layers = 8
+        self.hidden_size = feat_dim
+        self.lstm = nn.LSTM(
+            input_size=feat_dim,
+            hidden_size=feat_dim,
+            num_layers=self.num_layers,
+            batch_first=True
+        )
+        self.head = nn.Linear(feat_dim, num_actions)
+
+    def forward(self, X, mask=None):
+        B, S, D = X.shape
+
+        # initialize hidden states PER BATCH
+        h0 = torch.zeros(self.num_layers, B, D, device=X.device)
+        c0 = torch.zeros(self.num_layers, B, D, device=X.device)
+
+        out, _ = self.lstm(X, (h0, c0))   # out: (B, S, D)
+        out = out.reshape(B * S, D)
+        return self.head(out)
+
+
+class LSTMCritic(nn.Module):
+    def __init__(self, feat_dim: int):
+        super().__init__()
+        self.num_layers = 8
+        self.hidden_size = feat_dim
+        self.lstm = nn.LSTM(
+            input_size=feat_dim,
+            hidden_size=feat_dim,
+            num_layers=self.num_layers,
+            batch_first=True
+        )
+        self.head = nn.Linear(feat_dim, 1)
+
+    def forward(self, X, mask=None):
+        B, S, D = X.shape
+
+        # initialize hidden states PER BATCH
+        h0 = torch.zeros(self.num_layers, B, D, device=X.device)
+        c0 = torch.zeros(self.num_layers, B, D, device=X.device)
+
+        out, _ = self.lstm(X, (h0, c0))   # out: (B, S, D)
+        out = out.reshape(B * S, D)
+        return self.head(out)
+

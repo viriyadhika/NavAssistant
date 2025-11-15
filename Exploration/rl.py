@@ -336,7 +336,7 @@ class PPO():
         return logps, entropies, values
     
 
-    def compute_gae(rewards, values, dones, gamma=GAMMA, lam=GAE_LAMBDA):
+    def compute_gae(self, rewards, values, dones, gamma=GAMMA, lam=GAE_LAMBDA):
         T = len(rewards)
         adv = torch.zeros(T, dtype=torch.float32)
         vals = torch.tensor(values + [0.0], dtype=torch.float32)  # bootstrap V_{T}=0 unless you pass last V
