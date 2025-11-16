@@ -153,6 +153,8 @@ class RNDIntrinsicReward(nn.Module):
         self.predictor = CNNEncoder(self.feat_dim, self.n_hidden).to(DEVICE)
         self.predictor.train()
         self.optimizer = torch.optim.Adam(self.predictor.parameters(), lr=self.lr)
+        self.rnd_mean = 0.0
+        self.rnd_var  = 1.0
 
 
 class Env(ABC):
@@ -175,12 +177,10 @@ class RNDIntrinsicEnv(Env):
 
         feats = self.reward_module.pre_process_rnd(event)
         reward = self.reward_module.compute_reward(feats)
-        if "Move" in action_str:
-            reward = reward * 1.5 if reward > 0 else reward / 1.5
         return event, reward
     
     def reset(self):
-        pass
+        self.reward_module.reset()
 
 
 import torch
@@ -269,6 +269,7 @@ class CLIPNovelty:
         self.buffer_size = buffer_size
         self.topk = topk
         self.tau = tau
+        self.running_reward = 0.0  # EMA baseline
 
     @torch.no_grad()
     def compute_reward(self, frame_np):
@@ -295,7 +296,11 @@ class CLIPNovelty:
         topk_sim = torch.topk(sims, k, largest=True).values.mean().item()
 
         # 4) Novelty reward (larger when less similar)
-        reward = 1.0 - topk_sim
+        reward_raw = 1.0 - topk_sim
+
+        # 5) Smooth reward with EMA to reduce noise
+        self.running_reward = self.tau * self.running_reward + (1 - self.tau) * reward_raw
+        reward = reward_raw - self.running_reward   # "relative novelty"
 
         # 6) Update buffer
         self.buffer.append(emb.detach())
@@ -326,7 +331,7 @@ class ClipEnv(Env):
         fail_penalty = 0 if event.metadata["lastActionSuccess"] else -0.2
         self.last_action = action_str
 
-        return event, 5 * reward + pos_bonus + fail_penalty
+        return event, 3 * reward + pos_bonus + fail_penalty
     
     def reset(self):
         self.clip_novelty.reset()
@@ -431,6 +436,8 @@ class PPO():
 
     def compute_gae(self, rewards, values, dones, gamma=GAMMA, lam=GAE_LAMBDA):
         T = len(rewards)
+        rewards = torch.tensor(rewards, dtype=torch.float32, device=DEVICE)
+        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
         adv = torch.zeros(T, dtype=torch.float32)
         vals = torch.tensor(values + [0.0], dtype=torch.float32)  # bootstrap V_{T}=0 unless you pass last V
         lastgaelam = 0.0
@@ -491,103 +498,3 @@ class PPO():
             if epoch % 10 == 0:
                 print(f"[PPO] Epoch {epoch}: Loss={loss.item():.4f}, Policy={policy_loss.item():.4f}, Value={value_loss.item():.4f}")
 
-
-class GRPO:
-    def __init__(self, entropy_coef: float):
-        self.entropy_coef = entropy_coef
-
-    def obs_from_event(self, event):
-        frame = event.frame.copy()
-        return transform(frame).to(DEVICE)  # (3,H,W) tensor
-
-    @torch.no_grad()
-    def act(self, obs_seq, actions_seq, actor_critic: ActorCritic):
-        """
-        obs_seq: (1, seq_len, 3, H, W)
-        actions_seq: (1, seq_len)
-        returns: logits (num_actions,)
-        """
-        feats = actor_critic.actor_critic_encoder(obs_seq)
-        logits_seq = actor_critic.actor(feats, actions_seq, mask=None)
-        logits = logits_seq[-1, :]  # only latest timestep
-        return logits
-
-    def evaluate_batch(self, obs, actions, actor_critic):
-        """
-        obs:     (B, S, 3, H, W)
-        actions: (B*S,)
-        returns: logps, entropies
-        """
-        b, s, c, h, w = obs.shape
-        feats = actor_critic.actor_critic_encoder(obs)  # (B, S, D)
-
-        # Causal mask for autoregressive transformer
-        causal_mask = torch.full((s, s), float('-inf'), device=feats.device)
-        causal_mask = torch.triu(causal_mask, diagonal=1)
-
-        # Shifted actions (previous actions as input)
-        actions = actions.view(b, s)
-        actions_seq = torch.cat(
-            [torch.zeros_like(actions[:, :1]), actions[:, :-1]], dim=1
-        )
-
-        logits = actor_critic.actor(feats, actions_seq, causal_mask)
-        dist = torch.distributions.Categorical(logits=logits)
-        logps = dist.log_prob(actions.view(-1))
-        entropies = dist.entropy()
-
-        return logps, entropies
-
-    def compute_advantages(self, rewards, gamma=GAMMA):
-        """
-        Compute discounted returns directly (no critic).
-        """
-        T = len(rewards)
-        returns = torch.zeros(T, dtype=torch.float32)
-        G = 0.0
-        for t in reversed(range(T)):
-            G = rewards[t] + gamma * G
-            returns[t] = G
-        # Normalize returns → used as advantage
-        advantages = (returns - returns.mean()) / (returns.std() + 1e-8)
-        return advantages, returns
-
-    def grpo_update(self, buffer: RolloutBuffer, actor_critic: ActorCritic):
-        """
-        GRPO update:
-        - No critic, no value loss
-        - Uses normalized discounted returns as advantages
-        """
-        T = len(buffer)
-        c, h, w = buffer.obs[0].shape
-        obs = torch.stack(buffer.obs).to(DEVICE).view(MINIBATCHES, T // MINIBATCHES, c, h, w)
-        actions = torch.tensor(buffer.actions, dtype=torch.long, device=DEVICE)
-        old_logps = torch.tensor(buffer.logps, dtype=torch.float32, device=DEVICE)
-
-        # Compute advantages purely from rewards
-        advantages, returns = self.compute_advantages(buffer.rewards)
-        advantages = advantages.to(DEVICE)
-
-        for epoch in range(TRAIN_EPOCHS):
-            new_logp, entropy = self.evaluate_batch(obs, actions, actor_critic)
-
-            ratio = torch.exp(new_logp - old_logps)
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1.0 - PPO_CLIP, 1.0 + PPO_CLIP) * advantages
-            policy_loss = -torch.min(surr1, surr2).mean()
-            entropy_bonus = entropy.mean()
-
-            # Total GRPO loss
-            loss = policy_loss - self.entropy_coef * entropy_bonus
-
-            actor_critic.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            nn.utils.clip_grad_norm_(
-                list(actor_critic.actor_critic_encoder.parameters()) +
-                list(actor_critic.actor.parameters()),
-                MAX_GRAD_NORM
-            )
-            actor_critic.optimizer.step()
-
-            if epoch % 10 == 0:
-                print(f"[GRPO] Epoch {epoch}: Loss={loss.item():.4f}, Policy={policy_loss.item():.4f}")
