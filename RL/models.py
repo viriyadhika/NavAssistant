@@ -80,10 +80,12 @@ class FrozenResNetEncoder(nn.Module):
 
 
 class LSTMActor(nn.Module):
-    def __init__(self, feat_dim: int, num_actions: int):
+    def __init__(self, feat_dim: int, num_actions: int, truncation_len=32):
         super().__init__()
         self.num_layers = 8
         self.hidden_size = feat_dim
+        self.truncation_len = truncation_len
+
         self.lstm = nn.LSTM(
             input_size=feat_dim,
             hidden_size=feat_dim,
@@ -92,23 +94,48 @@ class LSTMActor(nn.Module):
         )
         self.head = nn.Linear(feat_dim, num_actions)
 
-    def forward(self, X, action_seq, mask=None):
+    def forward(self, X, action_seq, mask):
+        """
+        X: (B, S, D)
+        returns:
+            logits: (B*S, num_actions)
+            (h, c): final hidden state
+        """
         B, S, D = X.shape
+        T = self.truncation_len
 
-        # initialize hidden states PER BATCH
-        h0 = torch.zeros(self.num_layers, B, D, device=X.device)
-        c0 = torch.zeros(self.num_layers, B, D, device=X.device)
+        # ---- initial hidden state ----
+        h = torch.zeros(self.num_layers, B, D, device=X.device)
+        c = torch.zeros(self.num_layers, B, D, device=X.device)
+        outputs = []
 
-        out, _ = self.lstm(X, (h0, c0))   # out: (B, S, D)
-        out = out.reshape(B * S, D)
-        return self.head(out)
+        # ---- truncated BPTT loop ----
+        for start in range(0, S, T):
+            end = min(S, start + T)
+            chunk = X[:, start:end, :]   # (B, T, D)
+
+            out, (h, c) = self.lstm(chunk, (h, c))
+
+            # detach hidden state so gradients don’t flow across chunks
+            h = h.detach()
+            c = c.detach()
+
+            outputs.append(out)
+
+        # ---- concatenate outputs ----
+        outputs = torch.cat(outputs, dim=1)   # (B, S, D)
+
+        logits = self.head(outputs.reshape(B * S, D))
+        return logits
 
 
 class LSTMCritic(nn.Module):
-    def __init__(self, feat_dim: int):
+    def __init__(self, feat_dim: int, truncation_len=32):
         super().__init__()
         self.num_layers = 8
         self.hidden_size = feat_dim
+        self.truncation_len = truncation_len
+
         self.lstm = nn.LSTM(
             input_size=feat_dim,
             hidden_size=feat_dim,
@@ -117,14 +144,36 @@ class LSTMCritic(nn.Module):
         )
         self.head = nn.Linear(feat_dim, 1)
 
-    def forward(self, X, mask=None):
+    def forward(self, X, mask):
+        """
+        X: (B, S, D)
+        returns:
+            logits: (B*S, num_actions)
+            (h, c): final hidden state
+        """
         B, S, D = X.shape
+        T = self.truncation_len
 
-        # initialize hidden states PER BATCH
-        h0 = torch.zeros(self.num_layers, B, D, device=X.device)
-        c0 = torch.zeros(self.num_layers, B, D, device=X.device)
+        # ---- initial hidden state ----
+        h = torch.zeros(self.num_layers, B, D, device=X.device)
+        c = torch.zeros(self.num_layers, B, D, device=X.device)
+        outputs = []
 
-        out, _ = self.lstm(X, (h0, c0))   # out: (B, S, D)
-        out = out.reshape(B * S, D)
-        return self.head(out)
+        # ---- truncated BPTT loop ----
+        for start in range(0, S, T):
+            end = min(S, start + T)
+            chunk = X[:, start:end, :]   # (B, T, D)
 
+            out, (h, c) = self.lstm(chunk, (h, c))
+
+            # detach hidden state so gradients don’t flow across chunks
+            h = h.detach()
+            c = c.detach()
+
+            outputs.append(out)
+
+        # ---- concatenate outputs ----
+        outputs = torch.cat(outputs, dim=1)   # (B, S, D)
+
+        logits = self.head(outputs.reshape(B * S, D))
+        return logits
