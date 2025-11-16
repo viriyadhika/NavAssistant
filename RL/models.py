@@ -94,7 +94,7 @@ class LSTMActor(nn.Module):
         )
         self.head = nn.Linear(feat_dim, num_actions)
 
-    def forward(self, X, action_seq, mask):
+    def forward(self, X, actions_seq, mask):
         """
         X: (B, S, D)
         returns:
@@ -177,3 +177,167 @@ class LSTMCritic(nn.Module):
 
         logits = self.head(outputs.reshape(B * S, D))
         return logits
+
+
+class SlidingWindowTransformerActor(nn.Module):
+    def __init__(self, feat_dim: int, num_actions: int, window=128, n_layers=4, n_heads=8):
+        """
+        feat_dim : embedding dimension
+        window   : sliding window length (e.g., 32)
+        """
+        super().__init__()
+        self.window = window
+
+        # positional embedding for window
+        self.pos_embed = nn.Parameter(torch.zeros(1, window, feat_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        # transformer encoder
+        layer = nn.TransformerEncoderLayer(
+            d_model=feat_dim,
+            nhead=n_heads,
+            dim_feedforward=4 * feat_dim,
+            batch_first=True
+        )
+        self.tr = nn.TransformerEncoder(layer, num_layers=n_layers)
+
+        # value head
+        self.value_head = nn.Linear(feat_dim, num_actions)
+
+    def _get_window(self, seq):
+        """
+        seq : (B, S, D)
+        returns last `window` frames padded to full length
+        """
+        B, S, D = seq.shape
+        W = self.window
+
+        if S >= W:
+            return seq[:, S-W:S, :]     # take last W
+        else:
+            pad = W - S
+            # pad by repeating the first frame (or zeros)
+            pad_block = seq[:, :1, :].repeat(1, pad, 1)
+            return torch.cat([pad_block, seq], dim=1)
+
+    def forward(self, X, actions_seq, mask):
+        """
+        X: (B, S, D)
+        mask: ignored (kept for API compatibility)
+        returns: (B*S, 1)
+        """
+        B, S, D = X.shape
+
+        # ---- 1. Build sliding windows ----
+        # For each t, we build a window of length W ending at t
+        W = self.window
+
+        # Create tensor to hold all windows
+        # windows[t] = window ending at timestep t
+        windows = []
+        for t in range(S):
+            seq_t = X[:, :t+1, :]      # (B, t+1, D)
+            win_t = self._get_window(seq_t)  # (B, W, D)
+            windows.append(win_t)
+
+        # Stack → (B, S, W, D)
+        windows = torch.stack(windows, dim=1)
+
+        # reshape into (B*S, W, D)
+        flat = windows.reshape(B*S, W, D)
+
+        # ---- 2. Add positional encoding ----
+        flat = flat + self.pos_embed
+
+        # ---- 3. Transformer ----
+        z = self.tr(flat)           # (B*S, W, D)
+
+        # ---- 4. Use last token only ----
+        last_token = z[:, -1]       # (B*S, D)
+
+        # ---- 5. Value head ----
+        values = self.value_head(last_token) # (B*S, 1)
+
+        return values
+
+
+class SlidingWindowTransformerCritic(nn.Module):
+    def __init__(self, feat_dim: int, window=128, n_layers=4, n_heads=8):
+        """
+        feat_dim : embedding dimension
+        window   : sliding window length (e.g., 32)
+        """
+        super().__init__()
+        self.window = window
+
+        # positional embedding for window
+        self.pos_embed = nn.Parameter(torch.zeros(1, window, feat_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        # transformer encoder
+        layer = nn.TransformerEncoderLayer(
+            d_model=feat_dim,
+            nhead=n_heads,
+            dim_feedforward=4 * feat_dim,
+            batch_first=True
+        )
+        self.tr = nn.TransformerEncoder(layer, num_layers=n_layers)
+
+        # value head
+        self.value_head = nn.Linear(feat_dim, 1)
+
+    def _get_window(self, seq):
+        """
+        seq : (B, S, D)
+        returns last `window` frames padded to full length
+        """
+        B, S, D = seq.shape
+        W = self.window
+
+        if S >= W:
+            return seq[:, S-W:S, :]     # take last W
+        else:
+            pad = W - S
+            # pad by repeating the first frame (or zeros)
+            pad_block = seq[:, :1, :].repeat(1, pad, 1)
+            return torch.cat([pad_block, seq], dim=1)
+
+    def forward(self, X, mask):
+        """
+        X: (B, S, D)
+        mask: ignored (kept for API compatibility)
+        returns: (B*S, 1)
+        """
+        B, S, D = X.shape
+
+        # ---- 1. Build sliding windows ----
+        # For each t, we build a window of length W ending at t
+        W = self.window
+
+        # Create tensor to hold all windows
+        # windows[t] = window ending at timestep t
+        windows = []
+        for t in range(S):
+            seq_t = X[:, :t+1, :]      # (B, t+1, D)
+            win_t = self._get_window(seq_t)  # (B, W, D)
+            windows.append(win_t)
+
+        # Stack → (B, S, W, D)
+        windows = torch.stack(windows, dim=1)
+
+        # reshape into (B*S, W, D)
+        flat = windows.reshape(B*S, W, D)
+
+        # ---- 2. Add positional encoding ----
+        flat = flat + self.pos_embed
+
+        # ---- 3. Transformer ----
+        z = self.tr(flat)           # (B*S, W, D)
+
+        # ---- 4. Use last token only ----
+        last_token = z[:, -1]       # (B*S, D)
+
+        # ---- 5. Value head ----
+        values = self.value_head(last_token) # (B*S, 1)
+
+        return values
