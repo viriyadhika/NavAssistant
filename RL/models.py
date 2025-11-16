@@ -180,7 +180,7 @@ class LSTMCritic(nn.Module):
 
 
 class SlidingWindowTransformerActor(nn.Module):
-    def __init__(self, feat_dim: int, num_actions: int, window=64, n_layers=4, n_heads=8):
+    def __init__(self, feat_dim: int, num_actions: int, window=32, n_layers=4, n_heads=8):
         """
         feat_dim : embedding dimension
         window   : sliding window length (e.g., 32)
@@ -219,6 +219,21 @@ class SlidingWindowTransformerActor(nn.Module):
             # pad by repeating the first frame (or zeros)
             pad_block = seq[:, :1, :].repeat(1, pad, 1)
             return torch.cat([pad_block, seq], dim=1)
+    
+    def _transformer_chunked(self, x, chunk_size=128):
+        """
+        x: (N, W, D)
+        returns: (N, W, D)
+        """
+        outputs = []
+        N = x.size(0)
+
+        for i in range(0, N, chunk_size):
+            chunk = x[i:i+chunk_size]   # (chunk, W, D)
+            out = self.tr(chunk)        # transformer on mini-batch
+            outputs.append(out)
+
+        return torch.cat(outputs, dim=0)
 
     def forward(self, X, actions_seq, mask):
         """
@@ -250,7 +265,7 @@ class SlidingWindowTransformerActor(nn.Module):
         flat = flat + self.pos_embed
 
         # ---- 3. Transformer ----
-        z = self.tr(flat)           # (B*S, W, D)
+        z = self._transformer_chunked(flat)           # (B*S, W, D)
 
         # ---- 4. Use last token only ----
         last_token = z[:, -1]       # (B*S, D)
@@ -262,7 +277,7 @@ class SlidingWindowTransformerActor(nn.Module):
 
 
 class SlidingWindowTransformerCritic(nn.Module):
-    def __init__(self, feat_dim: int, window=64, n_layers=4, n_heads=8):
+    def __init__(self, feat_dim: int, window=32, n_layers=4, n_heads=8):
         """
         feat_dim : embedding dimension
         window   : sliding window length (e.g., 32)
@@ -302,6 +317,21 @@ class SlidingWindowTransformerCritic(nn.Module):
             pad_block = seq[:, :1, :].repeat(1, pad, 1)
             return torch.cat([pad_block, seq], dim=1)
 
+    def _transformer_chunked(self, x, chunk_size=128):
+        """
+        x: (N, W, D)
+        returns: (N, W, D)
+        """
+        outputs = []
+        N = x.size(0)
+
+        for i in range(0, N, chunk_size):
+            chunk = x[i:i+chunk_size]   # (chunk, W, D)
+            out = self.tr(chunk)        # transformer on mini-batch
+            outputs.append(out)
+
+        return torch.cat(outputs, dim=0)
+    
     def forward(self, X, mask):
         """
         X: (B, S, D)
@@ -332,7 +362,7 @@ class SlidingWindowTransformerCritic(nn.Module):
         flat = flat + self.pos_embed
 
         # ---- 3. Transformer ----
-        z = self.tr(flat)           # (B*S, W, D)
+        z = self._transformer_chunked(flat)           # (B*S, W, D)
 
         # ---- 4. Use last token only ----
         last_token = z[:, -1]       # (B*S, D)
