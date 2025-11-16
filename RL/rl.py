@@ -176,21 +176,36 @@ class PPO():
     @torch.no_grad()
     def act_and_value(self, feats, actions_seq, actor_critic: ActorCritic):
         """
-        obs_seq:     (1, seq_len, 3, H, W)
-        actions_seq: (1, seq_len)  -- previous actions (use 0 for the first)
+        feats:        (1, S, D)
+        actions_seq:  (1, S)
         returns:
-            logits: (num_actions,)  -- policy for the *next* action
-            value:  scalar          -- critic estimate for current state
+            logits: (num_actions,)
+            value:  scalar
         """
-
-        # Feed both vision + actions to actor and critic
-        logits_seq = actor_critic.actor(feats, actions_seq, mask=None)  # (1*seq_len, num_actions)
-        value_seq  = actor_critic.critic(feats, mask=None)              # (1*seq_len, 1)
-
-        # Get only the *last* timestep (the most recent frame)
-        logits = logits_seq[-1, :]          # (num_actions,)
-        value  = value_seq[-1, :].item()    # scalar
-
+    
+        # --- 1. Extract just the sliding window ---
+        W: int = actor_critic.actor.window   # same window size as actor/critic
+        _, S, D = feats.shape
+    
+        if S >= W:
+            feats_win   = feats[:, -W:, :]             # (1, W, D)
+            acts_win    = actions_seq[:, -W:]          # (1, W)
+        else:
+            pad = W - S
+            feats_pad = feats[:, :1, :].repeat(1, pad, 1)
+            acts_pad  = actions_seq[:, :1].repeat(1, pad)
+    
+            feats_win = torch.cat([feats_pad, feats], dim=1)       # (1, W, D)
+            acts_win  = torch.cat([acts_pad, actions_seq], dim=1)  # (1, W)
+    
+        # --- 2. Actor + Critic only on window ---
+        logits_seq = actor_critic.actor(feats_win, acts_win, mask=None)  # (W, num_actions)
+        value_seq  = actor_critic.critic(feats_win, mask=None)           # (W, 1)
+    
+        # --- 3. Take last timestep only ---
+        logits = logits_seq[-1]
+        value  = value_seq[-1].item()
+    
         return logits, value
 
     def evaluate_batch(self, feats: torch.Tensor, actions, actor_critic: ActorCritic):

@@ -180,7 +180,7 @@ class LSTMCritic(nn.Module):
 
 
 class SlidingWindowTransformerActor(nn.Module):
-    def __init__(self, feat_dim: int, num_actions: int, window=128, n_layers=4, n_heads=8):
+    def __init__(self, feat_dim: int, num_actions: int, window=64, n_layers=4, n_heads=8):
         """
         feat_dim : embedding dimension
         window   : sliding window length (e.g., 32)
@@ -262,7 +262,7 @@ class SlidingWindowTransformerActor(nn.Module):
 
 
 class SlidingWindowTransformerCritic(nn.Module):
-    def __init__(self, feat_dim: int, window=128, n_layers=4, n_heads=8):
+    def __init__(self, feat_dim: int, window=64, n_layers=4, n_heads=8):
         """
         feat_dim : embedding dimension
         window   : sliding window length (e.g., 32)
