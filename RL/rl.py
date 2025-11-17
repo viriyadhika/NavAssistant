@@ -153,16 +153,68 @@ class ClipEnv(Env):
 
         # --- Small bonus for moving away from recent average ---
         pos_bonus = np.linalg.norm(pos - avg_pos) / 2  # ~0–0.1 scale
-        fail_penalty = 0 if event.metadata["lastActionSuccess"] else -0.2
         self.last_action = action_str
 
-        return event, 3 * reward + pos_bonus + fail_penalty
+        return event, 3 * reward + pos_bonus
     
     def reset(self):
         self.clip_novelty.reset()
         self.positions = deque(maxlen=16)
         self.undo_count = 0
 
+
+class ClipEnvNoPenalty(Env):
+    def __init__(self, clip_novelty: CLIPNovelty):
+        super().__init__()
+        self.clip_novelty = clip_novelty
+        self.positions = deque(maxlen=16)
+        
+    def step_env(self, controller, action_idx):
+        action_str = ACTIONS[action_idx]
+        event = controller.step(action_str)
+    
+        reward = self.clip_novelty.compute_reward(event.frame)
+        pos = np.array([event.metadata["agent"]["position"]["x"], event.metadata["agent"]["position"]["z"]])
+        self.positions.append(pos)
+        avg_pos = np.mean(np.stack(self.positions), axis=0)
+
+        # --- Small bonus for moving away from recent average ---
+        pos_bonus = np.linalg.norm(pos - avg_pos) / 2  # ~0–0.1 scale
+        self.last_action = action_str
+
+        return event, 3 * reward + pos_bonus
+    
+    def reset(self):
+        self.clip_novelty.reset()
+        self.positions = deque(maxlen=16)
+        self.undo_count = 0
+
+
+class ClipEnvNoCuriosity(Env):
+    def __init__(self, clip_novelty: CLIPNovelty):
+        super().__init__()
+        self.clip_novelty = clip_novelty
+        self.positions = deque(maxlen=16)
+        
+    def step_env(self, controller, action_idx):
+        action_str = ACTIONS[action_idx]
+        event = controller.step(action_str)
+    
+        pos = np.array([event.metadata["agent"]["position"]["x"], event.metadata["agent"]["position"]["z"]])
+        self.positions.append(pos)
+        avg_pos = np.mean(np.stack(self.positions), axis=0)
+
+        # --- Small bonus for moving away from recent average ---
+        pos_bonus = np.linalg.norm(pos - avg_pos) / 2  # ~0–0.1 scale
+        self.last_action = action_str
+        fail_penalty = 0 if event.metadata["lastActionSuccess"] else -0.2
+
+        return event, 2 * (pos_bonus + fail_penalty)
+    
+    def reset(self):
+        self.clip_novelty.reset()
+        self.positions = deque(maxlen=16)
+        self.undo_count = 0
 
 class PPO():
     def __init__(self, ENTROPY_COEF: float):
