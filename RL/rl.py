@@ -8,7 +8,9 @@ from collections import deque
 from PIL import Image
 import numpy as np
 from abc import ABC, abstractmethod
-
+import matplotlib.pyplot as plt
+import imageio
+from typing import Callable
 
 class RolloutBuffer:
     def __init__(self):
@@ -354,4 +356,153 @@ class PPO():
             # Optional: print every few epochs
             if epoch % 10 == 0:
                 print(f"[PPO] Epoch {epoch}: Loss={loss.item():.4f}, Policy={policy_loss.item():.4f}, Value={value_loss.item():.4f}")
+
+
+def teleport(controller, target=None):
+    event = controller.step("GetReachablePositions")
+    reachable_positions = event.metadata["actionReturn"]
+    # Pick a random target
+    if target is None:
+        target = np.random.choice(reachable_positions)
+
+    event = controller.step(
+        action="TeleportFull",
+        x=target["x"],
+        y=target["y"],
+        z=target["z"],
+        rotation={"x": 0, "y": 0, "z": 0},
+        horizon=0,
+        standing=True
+    )
+
+    return event
+
+
+
+def inference(
+        get_distribution: Callable[[torch.Tensor, torch.Tensor, ActorCritic], torch.distributions.Categorical],
+        controller,
+        ppo: PPO,
+        init_position: dict[str, float], 
+        env: Env, 
+        actor_critic: ActorCritic, 
+        plot=True
+    ):
+    n = 256
+    n_row = 32
+    positions = []
+
+    plt.figure(figsize=(n // n_row * 2, n_row * 2))
+    event = teleport(controller, init_position)
+    episode_seq = deque(maxlen=EPISODE_STEPS)
+    actions_seq = deque(maxlen=EPISODE_STEPS)
+    raw_obs = []
+    for t in range(1, n + 1):
+        positions.append([event.metadata["agent"]["position"]["x"], event.metadata["agent"]["position"]["z"]])
+        with torch.no_grad():
+            obs_t = ppo.obs_from_event(event)  # (C,H,W)
+            obs_t_encoded = actor_critic.actor_critic_encoder(obs_t.unsqueeze(0).unsqueeze(0)).squeeze(0).squeeze(0)
+            obs_seq = torch.stack(list(episode_seq) + [obs_t_encoded], dim=0).unsqueeze(0).to(device=DEVICE)
+
+        if len(actions_seq) == 0:
+            actions_seq.append(torch.randint(0, NUM_ACTIONS, (1, 1)).item())
+        
+        actions_tensor = torch.tensor(actions_seq, dtype=torch.long, device=DEVICE).unsqueeze(0)
+        dist = get_distribution(obs_seq, actions_tensor, actor_critic)
+        action_idx = dist.sample()
+        logp = dist.log_prob(action_idx)
+        
+        action_idx, logp = action_idx.item(), logp.item()
+        event, reward = env.step_env(controller, action_idx)
+
+        # store one step
+        episode_seq.append(obs_t_encoded)
+        actions_seq.append(action_idx)
+        raw_obs.append(obs_t)
+        
+        if plot:
+            # Plot frame and action
+            plt.subplot(n_row, n // n_row, t)
+            plt.title("action: " + ACTIONS[action_idx] + ", r: " + f"{reward:.2f}" + "\n, prob = " + f"{torch.exp(dist.log_prob(torch.tensor([0, 1, 2], device=DEVICE))).cpu().numpy()}", fontsize=5)
+            plt.axis(False)
+            plt.imshow(event.frame)
+    if plot:
+        plt.tight_layout()
+        plt.show()
+        
+        # ---- Plot 2D trajectory of the agent ----
+        positions = np.array(positions)
+        plt.figure(figsize=(4, 4))
+        plt.plot(positions[:, 0], positions[:, 1], "-o", markersize=3)
+        plt.xlabel("x")
+        plt.ylabel("z")
+        plt.title("Agent trajectory over n steps")
+        plt.grid(True)
+        plt.show()
+
+    return raw_obs
+
+def inference_video_mp4(
+    get_distribution: Callable[[PPO, torch.Tensor, torch.Tensor, ActorCritic], torch.distributions.Categorical],
+    controller,
+    ppo: PPO,
+    init_position: dict[str, float], 
+    env: Env, 
+    actor_critic: ActorCritic, 
+    video_path="rollout.mp4",
+    fps=10,
+    n_steps=512
+):
+    episode_seq = deque(maxlen=EPISODE_STEPS)
+    actions_seq = deque(maxlen=EPISODE_STEPS)
+
+    writer = imageio.get_writer(video_path, fps=fps)
+
+    # start episode
+    event = teleport(controller, init_position)
+    positions = []
+
+    for t in range(1, n_steps + 1):
+
+        # ---- Add current frame to video ----
+        writer.append_data(event.frame[:, :, ::-1])   # convert RGB→BGR if needed
+
+        # track positions
+        positions.append([
+            event.metadata["agent"]["position"]["x"],
+            event.metadata["agent"]["position"]["z"],
+        ])
+
+        with torch.no_grad():
+            obs_t = ppo.obs_from_event(event)  
+            obs_enc = actor_critic.actor_critic_encoder(
+                obs_t.unsqueeze(0).unsqueeze(0)
+            ).squeeze(0).squeeze(0)
+
+            obs_seq = torch.stack(
+                list(episode_seq) + [obs_enc], dim=0
+            ).unsqueeze(0).to(DEVICE)
+
+        # ---- Action ----
+        if len(actions_seq) == 0:
+            actions_seq.append(torch.randint(0, NUM_ACTIONS, ()).item())
+
+        actions_tensor = torch.tensor(
+            actions_seq, dtype=torch.long, device=DEVICE
+        ).unsqueeze(0)
+
+        dist = get_distribution(ppo, obs_seq, actions_tensor, actor_critic)
+        action_idx = dist.sample().item()
+
+        # ---- Step env ----
+        event, reward = env.step_env(controller, action_idx)
+
+        # ---- Store ----
+        episode_seq.append(obs_enc)
+        actions_seq.append(action_idx)
+
+    writer.close()
+    print(f"[🎞️] Saved video to {video_path}")
+
+    return positions
 
