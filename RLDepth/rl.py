@@ -185,7 +185,7 @@ class ClipEnv(Env):
     def __init__(self, clip_novelty: CLIPNovelty):
         super().__init__()
         self.clip_novelty = clip_novelty
-        self.positions = deque(maxlen=16)
+        self.positions = deque(maxlen=32)
 
     def step_env(self, controller, action_idx):
         action_str = ACTIONS[action_idx]
@@ -206,14 +206,14 @@ class ClipEnv(Env):
 
     def reset(self):
         self.clip_novelty.reset()
-        self.positions = deque(maxlen=16)
+        self.positions = deque(maxlen=32)
 
 
 class ClipEnvNoPenalty(Env):
     def __init__(self, clip_novelty: CLIPNovelty):
         super().__init__()
         self.clip_novelty = clip_novelty
-        self.positions = deque(maxlen=16)
+        self.positions = deque(maxlen=32)
 
     def step_env(self, controller, action_idx):
         action_str = ACTIONS[action_idx]
@@ -234,14 +234,14 @@ class ClipEnvNoPenalty(Env):
 
     def reset(self):
         self.clip_novelty.reset()
-        self.positions = deque(maxlen=16)
+        self.positions = deque(maxlen=32)
 
 
 class ClipEnvNoCuriosity(Env):
     def __init__(self, clip_novelty: CLIPNovelty):
         super().__init__()
         self.clip_novelty = clip_novelty
-        self.positions = deque(maxlen=16)
+        self.positions = deque(maxlen=32)
 
     def step_env(self, controller, action_idx):
         action_str = ACTIONS[action_idx]
@@ -262,7 +262,7 @@ class ClipEnvNoCuriosity(Env):
 
     def reset(self):
         self.clip_novelty.reset()
-        self.positions = deque(maxlen=16)
+        self.positions = deque(maxlen=32)
 
 
 # ---------------------------------------------------------
