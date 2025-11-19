@@ -360,13 +360,13 @@ class PPO:
         PPO update using fused RGB+Depth features stored in buffer.
         """
         T = len(buffer)
-        d = buffer.encoded_rgb[0].shape[0]
 
         rgb = torch.stack(buffer.encoded_rgb).to(DEVICE)       # (T, D)
         depth = torch.stack(buffer.encoded_depth).to(DEVICE)   # (T, D)
 
         # simple fusion: addition (same dimensionality)
-        fused = rgb + depth                                    # (T, D)
+        fused = torch.cat([rgb, depth], dim=-1)              # (T, D)
+        d = fused.shape[-1]
 
         fused = fused.view(MINIBATCHES, T // MINIBATCHES, d)   # (B, S, D)
         actions = torch.tensor(buffer.actions, dtype=torch.long, device=DEVICE)

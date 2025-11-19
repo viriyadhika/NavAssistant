@@ -78,30 +78,39 @@ class FrozenResNetEncoder(nn.Module):
 # ---------------------------------------------------------
 #  Depth Encoder (trainable)
 # ---------------------------------------------------------
-class FrozenResNetDepthEncoder(nn.Module):
+class ConvDepthEncoder(nn.Module):
     """
-    Encodes depth maps (1 x H x W) into feat_dim embeddings.
-    Uses a ResNet-18 backbone adapted to 1-channel input.
-    We DO NOT freeze this; it is meant to be trained.
+    Encodes depth maps (1 x H x W) into feat_dim embeddings using a lightweight ConvNet.
+    No chunking — processes B*S frames directly.
+
     Input:  x  (B, S, 1, H, W)
     Output: (B, S, feat_dim)
     """
-    def __init__(self, feat_dim: int = FEAT_DIM, device: str = DEVICE, chunk_size: int = 32):
+    def __init__(self, feat_dim: int = FEAT_DIM, device: str = DEVICE):
         super().__init__()
 
-        resnet = tv_models.resnet18(weights=None)
+        # Lightweight ConvNet for depth
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=5, stride=2, padding=2),   # -> (32, H/2, W/2)
+            nn.ReLU(inplace=True),
 
-        # Modify first conv: 1 input channel for depth
-        resnet.conv1 = nn.Conv2d(
-            1, 64, kernel_size=7, stride=2, padding=3, bias=False
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # -> (64, H/4, W/4)
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1), # -> (128, H/8, W/8)
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),# -> (256, H/16, W/16)
+            nn.ReLU(inplace=True),
+
+            nn.AdaptiveAvgPool2d((1, 1)),                          # -> (256,1,1)
         )
 
-        self.backbone = nn.Sequential(*list(resnet.children())[:-1])  # (B,512,1,1)
-        self.proj = nn.Linear(512, feat_dim)
+        # Final projection to the shared embedding dimension
+        self.proj = nn.Linear(256, feat_dim)
 
-        self.chunk_size = chunk_size
-        self.device = device
         self.feat_dim = feat_dim
+        self.device = device
         self.to(device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -110,20 +119,15 @@ class FrozenResNetDepthEncoder(nn.Module):
         returns: (B, S, feat_dim)
         """
         B, S, _, H, W = x.shape
-        x = x.reshape(B * S, 1, H, W)
 
-        outputs = []
-        for i in range(0, B * S, self.chunk_size):
-            chunk = x[i:i + self.chunk_size].to(self.device)
+        # Flatten time dimension into batch
+        x = x.view(B * S, 1, H, W)  # (B*S, 1, H, W)
 
-            f = self.backbone(chunk)   # (chunk, 512, 1, 1)
-            f = f.flatten(1)           # (chunk, 512)
-            f = self.proj(f)           # (chunk, feat_dim)
+        f = self.cnn(x)             # (B*S, 256, 1, 1)
+        f = f.flatten(1)            # (B*S, 256)
+        f = self.proj(f)            # (B*S, feat_dim)
 
-            outputs.append(f)
-
-        outputs = torch.cat(outputs, dim=0)
-        return outputs.view(B, S, self.feat_dim)
+        return f.view(B, S, self.feat_dim)
 
 
 # ---------------------------------------------------------
@@ -235,6 +239,7 @@ class SlidingWindowTransformerActor(nn.Module):
 
         # action embedding (same dim as features)
         self.action_embed = nn.Embedding(num_actions, feat_dim)
+        self.fuse = nn.Linear(2*feat_dim, feat_dim)
 
         # positional embedding for window
         self.pos_embed = nn.Parameter(torch.zeros(1, window, feat_dim))
@@ -292,12 +297,13 @@ class SlidingWindowTransformerActor(nn.Module):
             logits: (B*S, num_actions)
         """
         B, S, D = X.shape
+        D = D // 2 # Because X is fused between RGB and D channel
         W = self.window
 
         # --- 0. Add action embeddings ---
         if actions_seq is not None:
             a_emb = self.action_embed(actions_seq)  # (B, S, D)
-            X = X + a_emb
+            X = self.fuse(X) + a_emb
 
         # --- 1. Build sliding windows ---
         windows = []
@@ -337,6 +343,7 @@ class SlidingWindowTransformerCritic(nn.Module):
         self.feat_dim = feat_dim
 
         # positional embedding for window
+        self.fuse = nn.Linear(2*feat_dim, feat_dim)
         self.pos_embed = nn.Parameter(torch.zeros(1, window, feat_dim))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
@@ -390,6 +397,10 @@ class SlidingWindowTransformerCritic(nn.Module):
         """
         B, S, D = X.shape
         W = self.window
+
+        # Normalize back to FEATURE_DIM
+        X = self.fuse(X)
+        D = D // 2
 
         # 1. sliding windows
         windows = []
