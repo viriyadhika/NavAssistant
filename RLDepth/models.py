@@ -80,37 +80,32 @@ class FrozenResNetEncoder(nn.Module):
 # ---------------------------------------------------------
 class ConvDepthEncoder(nn.Module):
     """
-    Encodes depth maps (1 x H x W) into feat_dim embeddings using a lightweight ConvNet.
-    No chunking — processes B*S frames directly.
+    Encodes depth maps (1 x H x W) into feat_dim embeddings using chunking
+    to prevent GPU OOM for large B*S batches.
 
-    Input:  x  (B, S, 1, H, W)
+    Input:  (B, S, 1, H, W)
     Output: (B, S, feat_dim)
     """
-    def __init__(self, feat_dim: int = FEAT_DIM, device: str = DEVICE):
+    def __init__(self, feat_dim: int = FEAT_DIM, device: str = DEVICE, chunk_size=256):
         super().__init__()
 
-        # Lightweight ConvNet for depth
+        self.chunk_size = chunk_size
+        self.device = device
+
         self.cnn = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=5, stride=2, padding=2),   # -> (32, H/2, W/2)
+            nn.Conv2d(1, 32, kernel_size=5, stride=2, padding=2),
             nn.ReLU(inplace=True),
-
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # -> (64, H/4, W/4)
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True),
-
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1), # -> (128, H/8, W/8)
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True),
-
-            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),# -> (256, H/16, W/16)
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True),
-
-            nn.AdaptiveAvgPool2d((1, 1)),                          # -> (256,1,1)
+            nn.AdaptiveAvgPool2d((1, 1)),
         )
 
-        # Final projection to the shared embedding dimension
         self.proj = nn.Linear(256, feat_dim)
-
         self.feat_dim = feat_dim
-        self.device = device
         self.to(device)
 
     def forward(self, x):
