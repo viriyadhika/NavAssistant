@@ -443,67 +443,103 @@ def teleport(controller, target=None):
 #  Inference / Visualization
 # ---------------------------------------------------------
 def inference(
-        get_distribution: Callable[[PPO, torch.Tensor, torch.Tensor, ActorCritic],
-                                   torch.distributions.Categorical],
+        get_distribution,
         controller,
         ppo: PPO,
-        init_position: dict[str, float],
+        init_position: dict,
         env: Env,
         actor_critic: ActorCritic,
-        plot=True
+        plot=True,
+        n_steps=256,
+        n_rows=32
     ):
-    n = 256
-    n_row = 32
+
     positions = []
 
-    plt.figure(figsize=(n // n_row * 2, n_row * 2))
+    if plot:
+        plt.figure(figsize=(n_steps // n_rows * 2, n_rows * 2))
+
+    # reset env
     event = teleport(controller, init_position)
+
     episode_seq = deque(maxlen=EPISODE_STEPS)
     actions_seq = deque(maxlen=EPISODE_STEPS)
-
     raw_obs = []
 
-    for t in range(1, n + 1):
+    for t in range(1, n_steps + 1):
+
+        # Track x,z positions
         positions.append([
             event.metadata["agent"]["position"]["x"],
-            event.metadata["agent"]["position"]["z"]
+            event.metadata["agent"]["position"]["z"],
         ])
 
+        # ------------------------------
+        # 1. Encode RGB
+        # ------------------------------
+        rgb_t = ppo.obs_from_event(event)              # (3,H,W)
+        rgb_t = rgb_t.unsqueeze(0).unsqueeze(0)        # (1,1,3,H,W)
         with torch.no_grad():
-            rgb = ppo.obs_from_event(event)  # (3,H,W)
-            rgb_t = rgb.unsqueeze(0).unsqueeze(0)  # (1,1,3,H,W)
-            rgb_enc = actor_critic.rgb_encoder(rgb_t).squeeze(0).squeeze(0)  # (D,)
+            rgb_embed = actor_critic.rgb_encoder(rgb_t).squeeze(0).squeeze(0)
 
-            depth_np = event.depth_frame        # (H, W)
-            depth_t = torch.from_numpy(depth_np).float().unsqueeze(0).unsqueeze(0).to(DEVICE)  # (1,1,H,W)
-            depth_enc = actor_critic.depth_encoder(depth_t).squeeze(0).squeeze(0)  # (D,)
+        # ------------------------------
+        # 2. Encode DEPTH
+        # ------------------------------
+        depth_np = event.depth_frame              # numpy (H,W)
+        depth_t = torch.from_numpy(depth_np.copy()).float()
+        depth_t = depth_t.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # (1,1,1,H,W)
+        depth_t = depth_t.to(DEVICE) / 255.0
 
-            fused = rgb_enc + depth_enc
+        with torch.no_grad():
+            depth_embed = actor_critic.depth_encoder(depth_t).squeeze(0).squeeze(0)
 
-            obs_seq = torch.stack(list(episode_seq) + [fused], dim=0).unsqueeze(0).to(DEVICE)
+        # ------------------------------
+        # 3. Fuse (RGB + Depth)
+        # ------------------------------
+        fused_embed = torch.cat([rgb_embed, depth_embed], dim=-1)
 
+        raw_obs.append(rgb_t)
+
+        # ------------------------------
+        # 4. Build observation sequence
+        # ------------------------------
+        episode_seq.append(fused_embed)
+
+        obs_seq = torch.stack(list(episode_seq), dim=0).unsqueeze(0).to(DEVICE)
+        #         (1, S, 2D)
+
+        # ------------------------------
+        # 5. Build action sequence
+        # ------------------------------
         if len(actions_seq) == 0:
+            # warm start
             actions_seq.append(torch.randint(0, NUM_ACTIONS, ()).item())
 
-        actions_tensor = torch.tensor(list(actions_seq), dtype=torch.long, device=DEVICE).unsqueeze(0)
+        actions_tensor = torch.tensor(list(actions_seq), dtype=torch.long, device=DEVICE)
+        actions_tensor = actions_tensor.unsqueeze(0)  # (1,S)
 
+        # ------------------------------
+        # 6. Actor forward
+        # ------------------------------
         dist = get_distribution(ppo, obs_seq, actions_tensor, actor_critic)
-        action_idx = dist.sample().item()
-        logp_all = dist.log_prob(torch.arange(NUM_ACTIONS, device=DEVICE))
 
+        action_idx = dist.sample().item()
+        logp = dist.log_prob(torch.tensor(action_idx, device=DEVICE)).item()
+
+        # ------------------------------
+        # 7. Step environment
+        # ------------------------------
         event, reward = env.step_env(controller, action_idx)
 
-        episode_seq.append(fused)
         actions_seq.append(action_idx)
-        raw_obs.append(rgb)
 
+        # ------------------------------
+        # 8. Plotting
+        # ------------------------------
         if plot:
-            plt.subplot(n_row, n // n_row, t)
-            plt.title(
-                f"action: {ACTIONS[action_idx]}, r: {reward:.2f}\n"
-                f"probs={torch.exp(logp_all).cpu().numpy()}",
-                fontsize=5
-            )
+            plt.subplot(n_rows, n_steps // n_rows, t)
+            probs = torch.exp(dist.log_prob(torch.tensor([0,1,2], device=DEVICE))).cpu().numpy()
+            plt.title(f"act={ACTIONS[action_idx]}\nr={reward:.2f}\np={probs}", fontsize=4)
             plt.axis(False)
             plt.imshow(event.frame)
 
@@ -511,12 +547,13 @@ def inference(
         plt.tight_layout()
         plt.show()
 
+        # ---- Plot 2D trajectory ----
         positions = np.array(positions)
         plt.figure(figsize=(4, 4))
         plt.plot(positions[:, 0], positions[:, 1], "-o", markersize=3)
         plt.xlabel("x")
         plt.ylabel("z")
-        plt.title("Agent trajectory over n steps")
+        plt.title("Agent trajectory")
         plt.grid(True)
         plt.show()
 
@@ -524,8 +561,7 @@ def inference(
 
 
 def inference_video_mp4(
-    get_distribution: Callable[[PPO, torch.Tensor, torch.Tensor, ActorCritic],
-                               torch.distributions.Categorical],
+    get_distribution,
     controller,
     ppo: PPO,
     init_position: dict[str, float],
@@ -533,50 +569,87 @@ def inference_video_mp4(
     actor_critic: ActorCritic,
     video_path="rollout.mp4",
     fps=10,
-    n_steps=512
+    n_steps=512,
 ):
     episode_seq = deque(maxlen=EPISODE_STEPS)
     actions_seq = deque(maxlen=EPISODE_STEPS)
 
     writer = imageio.get_writer(video_path, fps=fps)
 
+    # reset env
     event = teleport(controller, init_position)
     positions = []
 
     for t in range(1, n_steps + 1):
+
+        # Write RGB frame to video
         writer.append_data(event.frame)
 
+        # Track position
         positions.append([
             event.metadata["agent"]["position"]["x"],
             event.metadata["agent"]["position"]["z"],
         ])
 
+        # -------------------------------------
+        # 1. Encode RGB
+        # -------------------------------------
         with torch.no_grad():
-            rgb = ppo.obs_from_event(event)
-            rgb_t = rgb.unsqueeze(0).unsqueeze(0)
+            rgb_t = ppo.obs_from_event(event)                   # (3,H,W)
+            rgb_t = rgb_t.unsqueeze(0).unsqueeze(0)             # (1,1,3,H,W)
             rgb_enc = actor_critic.rgb_encoder(rgb_t).squeeze(0).squeeze(0)
 
-            depth_np = event.depth_frame
-            depth_t = torch.from_numpy(depth_np).float().unsqueeze(0).unsqueeze(0).to(DEVICE)
+        # -------------------------------------
+        # 2. Encode Depth
+        # -------------------------------------
+        depth_np = event.depth_frame                           # numpy (H,W)
+        depth_t = torch.from_numpy(depth_np.copy()).float()
+        depth_t = depth_t.unsqueeze(0).unsqueeze(0).unsqueeze(0)   # (1,1,1,H,W)
+        depth_t = depth_t.to(DEVICE) / 255.0
+
+        with torch.no_grad():
             depth_enc = actor_critic.depth_encoder(depth_t).squeeze(0).squeeze(0)
 
-            fused = rgb_enc + depth_enc
-            obs_seq = torch.stack(list(episode_seq) + [fused], dim=0).unsqueeze(0).to(DEVICE)
+        # -------------------------------------
+        # 3. Fuse embeddings
+        # -------------------------------------
+        fused = torch.cat([rgb_enc, depth_enc], dim=-1)         # (2D,)
 
+        # -------------------------------------
+        # 4. Build observation sequence
+        # -------------------------------------
+        episode_seq.append(fused)
+
+        obs_seq = torch.stack(list(episode_seq), dim=0)         # (S,2D)
+        obs_seq = obs_seq.unsqueeze(0).to(DEVICE)               # (1,S,2D)
+
+        # -------------------------------------
+        # 5. Action sequence
+        # -------------------------------------
         if len(actions_seq) == 0:
             actions_seq.append(torch.randint(0, NUM_ACTIONS, ()).item())
 
-        actions_tensor = torch.tensor(list(actions_seq), dtype=torch.long, device=DEVICE).unsqueeze(0)
+        actions_tensor = torch.tensor(
+            list(actions_seq), dtype=torch.long, device=DEVICE
+        ).unsqueeze(0)                                          # (1,S)
+
+        # -------------------------------------
+        # 6. Query policy
+        # -------------------------------------
         dist = get_distribution(ppo, obs_seq, actions_tensor, actor_critic)
         action_idx = dist.sample().item()
 
+        # -------------------------------------
+        # 7. Step environment
+        # -------------------------------------
         event, reward = env.step_env(controller, action_idx)
 
-        episode_seq.append(fused)
         actions_seq.append(action_idx)
 
+    # -------------------------------------
+    # Finalize
+    # -------------------------------------
     writer.close()
     print(f"[🎞️] Saved video to {video_path}")
 
     return positions
-
