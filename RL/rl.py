@@ -465,7 +465,7 @@ def inference_video_mp4(
     for t in range(1, n_steps + 1):
 
         # ---- Add current frame to video ----
-        writer.append_data(event.frame[:, :, ::-1])   # convert RGB→BGR if needed
+        writer.append_data(event.frame)   # convert RGB→BGR if needed
 
         # track positions
         positions.append([
