@@ -46,27 +46,34 @@ class FrozenResNetEncoder(nn.Module):
             torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         )
 
-    def forward(self, x):
-            """
-            x : (B, S, 1, H, W)
-            """
-            B, S, _, H, W = x.shape
-            x = x.reshape(B * S, 1, H, W)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, S, C, H, W)
+        returns: (B, S, feat_dim)
+        """
+        b, s, c, h, w = x.shape
+        x = x.reshape(b * s, c, h, w)  # flatten sequence dimension
 
-            feats_list = []
-            N = B * S
+        feats_list = []
 
-            for i in range(0, N, self.chunk_size):
-                chunk = x[i:i + self.chunk_size].to(self.device)
+        # Process in chunks to avoid OOM
+        for i in range(0, b * s, self.chunk_size):
+            chunk = x[i:i + self.chunk_size].to(self.device)
 
-                f = self.cnn(chunk)         # (chunk, 256, 1, 1)
-                f = f.flatten(1)            # (chunk, 256)
-                f = self.proj(f)            # (chunk, feat_dim)
+            # Normalize for ResNet
+            chunk = (chunk - self.mean) / self.std
 
-                feats_list.append(f)
+            with torch.no_grad():
+                f = self.backbone(chunk)    # (chunk, 512, 1, 1)
+                f = f.flatten(1)            # (chunk, 512)
 
-            feats = torch.cat(feats_list, dim=0)
-            return feats.view(B, S, self.feat_dim)
+            # Project to feat_dim
+            f = self.proj(f)                # (chunk, feat_dim)
+            feats_list.append(f)
+
+        feats = torch.cat(feats_list, dim=0)    # (B*S, feat_dim)
+        return feats.view(b, s, self.feat_dim)  # (B, S, feat_dim)
+
 
 # ---------------------------------------------------------
 #  Depth Encoder (trainable)
@@ -106,21 +113,27 @@ class ConvDepthEncoder(nn.Module):
         self.device = device
         self.to(device)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         """
-        x: (B, S, 1, H, W)
-        returns: (B, S, feat_dim)
+        x : (B, S, 1, H, W)
         """
         B, S, _, H, W = x.shape
+        x = x.reshape(B * S, 1, H, W)
 
-        # Flatten time dimension into batch
-        x = x.view(B * S, 1, H, W)  # (B*S, 1, H, W)
+        feats_list = []
+        N = B * S
 
-        f = self.cnn(x)             # (B*S, 256, 1, 1)
-        f = f.flatten(1)            # (B*S, 256)
-        f = self.proj(f)            # (B*S, feat_dim)
+        for i in range(0, N, self.chunk_size):
+            chunk = x[i:i + self.chunk_size].to(self.device)
 
-        return f.view(B, S, self.feat_dim)
+            f = self.cnn(chunk)         # (chunk, 256, 1, 1)
+            f = f.flatten(1)            # (chunk, 256)
+            f = self.proj(f)            # (chunk, feat_dim)
+
+            feats_list.append(f)
+
+        feats = torch.cat(feats_list, dim=0)
+        return feats.view(B, S, self.feat_dim)
 
 
 # ---------------------------------------------------------
