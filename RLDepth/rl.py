@@ -488,7 +488,7 @@ def inference(
         depth_np = event.depth_frame              # numpy (H,W)
         depth_t = torch.from_numpy(depth_np.copy()).float()
         depth_t = depth_t.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # (1,1,1,H,W)
-        depth_t = depth_t.to(DEVICE) / 255.0
+        depth_t = depth_t.to(DEVICE) / 10
 
         with torch.no_grad():
             depth_embed = actor_critic.depth_encoder(depth_t).squeeze(0).squeeze(0)
@@ -539,7 +539,7 @@ def inference(
         if plot:
             plt.subplot(n_rows, n_steps // n_rows, t)
             probs = torch.exp(dist.log_prob(torch.tensor([0,1,2], device=DEVICE))).cpu().numpy()
-            plt.title(f"act={ACTIONS[action_idx]}\nr={reward:.2f}\np={probs}", fontsize=4)
+            plt.title(f"act={ACTIONS[action_idx]}\nr={reward:.2f}\np={probs}", fontsize=6)
             plt.axis(False)
             plt.imshow(event.frame)
 
@@ -605,7 +605,7 @@ def inference_video_mp4(
         depth_np = event.depth_frame                           # numpy (H,W)
         depth_t = torch.from_numpy(depth_np.copy()).float()
         depth_t = depth_t.unsqueeze(0).unsqueeze(0).unsqueeze(0)   # (1,1,1,H,W)
-        depth_t = depth_t.to(DEVICE) / 255.0
+        depth_t = depth_t.to(DEVICE) / 10
 
         with torch.no_grad():
             depth_enc = actor_critic.depth_encoder(depth_t).squeeze(0).squeeze(0)
