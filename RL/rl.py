@@ -408,7 +408,7 @@ def inference(
             actions_seq.append(torch.randint(0, NUM_ACTIONS, (1, 1)).item())
         
         actions_tensor = torch.tensor(actions_seq, dtype=torch.long, device=DEVICE).unsqueeze(0)
-        dist = get_distribution(obs_seq, actions_tensor, actor_critic)
+        dist = get_distribution(ppo, obs_seq, actions_tensor, actor_critic)
         action_idx = dist.sample()
         logp = dist.log_prob(action_idx)
         
