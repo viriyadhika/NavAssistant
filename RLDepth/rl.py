@@ -35,14 +35,14 @@ from cons import (
 # ---------------------------------------------------------
 class RolloutBuffer:
     def __init__(self):
-        self.encoded_rgb = []
-        self.encoded_depth = []
+        self.rgb = []
+        self.depth = []
         self.actions, self.logps = [], []
         self.rewards, self.values, self.dones = [], [], []
 
-    def add(self, rgb_embed, depth_embed, action_idx, logp, reward, value, done):
-        self.encoded_rgb.append(rgb_embed.cpu())
-        self.encoded_depth.append(depth_embed.cpu())
+    def add(self, rgb_frame, depth_frame, action_idx, logp, reward, value, done):
+        self.rgb.append(rgb_frame.cpu())
+        self.depth.append(depth_frame.cpu())
         self.actions.append(int(action_idx))
         self.logps.append(float(logp))
         self.rewards.append(float(reward))
@@ -272,15 +272,21 @@ class PPO:
     def __init__(self, ENTROPY_COEF: float):
         self.ENTROPY_COEF = ENTROPY_COEF
 
+    # -------------------------------------------------
+    #  Preprocess RGB from ai2thor event
+    # -------------------------------------------------
     def obs_from_event(self, event):
         frame = event.frame.copy()
         return transform(frame).to(DEVICE)  # (3,H,W) tensor
 
+    # -------------------------------------------------
+    #  Acting: use already-computed fused embeddings
+    # -------------------------------------------------
     @torch.no_grad()
     def act_and_value(self, feats, actions_seq, actor_critic: ActorCritic):
         """
-        feats:        (1, S, D_fused)  fused RGB+Depth embeddings
-        actions_seq:  (1, S)
+        feats:       (1, S, D_fused)  fused RGB+Depth embeddings
+        actions_seq: (1, S)
         returns:
             logits: (num_actions,)
             value:  scalar
@@ -289,61 +295,72 @@ class PPO:
         _, S, D = feats.shape
 
         if S >= W:
-            feats_win = feats[:, -W:, :]         # (1, W, D)
-            acts_win = actions_seq[:, -W:]       # (1, W)
+            feats_win = feats[:, -W:, :]      # (1, W, D)
+            acts_win = actions_seq[:, -W:]    # (1, W)
         else:
             pad = W - S
             feats_pad = feats[:, :1, :].repeat(1, pad, 1)
-            acts_pad = actions_seq[:, :1].repeat(1, pad)
+            acts_pad  = actions_seq[:, :1].repeat(1, pad)
 
             feats_win = torch.cat([feats_pad, feats], dim=1)  # (1, W, D)
-            acts_win = torch.cat([acts_pad, actions_seq], dim=1)
+            acts_win  = torch.cat([acts_pad, actions_seq], dim=1)
 
-        logits_seq = actor_critic.actor(feats_win, acts_win, mask=None)  # (W, num_actions)
-        value_seq = actor_critic.critic(feats_win, mask=None)            # (W, 1)
+        # actor/critic expect (B,S,D); here B=1,S=W
+        logits_flat = actor_critic.actor(feats_win, acts_win, mask=None)   # (W, num_actions)
+        values_flat = actor_critic.critic(feats_win, mask=None)            # (W, 1)
 
-        logits = logits_seq[-1]          # (num_actions,)
-        value = value_seq[-1].item()     # scalar
+        # take last time step
+        logits = logits_flat[-1]          # (num_actions,)
+        value  = values_flat[-1].item()   # scalar
 
         return logits, value
 
+    # -------------------------------------------------
+    #  Evaluate batch for PPO loss
+    # -------------------------------------------------
     def evaluate_batch(self, feats: torch.Tensor, actions, actor_critic: ActorCritic):
         """
-        feats:   (B, S, D) fused RGB+Depth embeddings
-        actions: (B*S,)   flattened actions
+        feats:   (B, S, D_fused) fused RGB+Depth embeddings
+        actions: (B*S,)          flattened actions
 
         returns:
             logps:      (B*S,)
             entropies:  (B*S,)
             values:     (B*S,)
         """
-        b, s, d = feats.shape
+        B, S, D = feats.shape
 
-        # causal mask (upper triangular) if you ever want to use it
-        causal_mask = torch.full((s, s), float('-inf'), device=feats.device)
-        causal_mask = torch.triu(causal_mask, diagonal=1)
-
-        actions = actions.view(b, s)  # (B, S)
+        # previous actions (with 0 at t=0)
+        actions = actions.view(B, S)                           # (B,S)
         actions_seq = torch.cat(
-            [torch.zeros_like(actions[:, :1]), actions[:, :-1]], dim=1
-        )  # previous actions
+            [torch.zeros_like(actions[:, :1]), actions[:, :-1]],
+            dim=1
+        )                                                      # (B,S)
 
-        logits = actor_critic.actor(feats, actions_seq, causal_mask)  # (B*S, num_actions)
-        dist = torch.distributions.Categorical(logits=logits)
+        # actor: (B,S,D) + (B,S) -> (B*S, num_actions)
+        logits_flat = actor_critic.actor(feats, actions_seq, mask=None)  # (B*S, num_actions)
+        dist = torch.distributions.Categorical(logits=logits_flat)
 
-        logps = dist.log_prob(actions.view(-1))    # (B*S,)
-        entropies = dist.entropy()                 # (B*S,)
-        values = actor_critic.critic(feats, causal_mask).squeeze(-1)  # (B*S,)
+        logps = dist.log_prob(actions.view(-1))                # (B*S,)
+        entropies = dist.entropy()                             # (B*S,)
 
-        return logps, entropies, values
+        # critic: (B,S,D) -> (B*S,1) -> (B*S,)
+        values_flat = actor_critic.critic(feats, mask=None).squeeze(-1)
 
+        return logps, entropies, values_flat
+
+    # -------------------------------------------------
+    #  GAE
+    # -------------------------------------------------
     def compute_gae(self, rewards, values, dones, gamma=GAMMA, lam=GAE_LAMBDA):
         T = len(rewards)
+
         rewards = torch.tensor(rewards, dtype=torch.float32, device=DEVICE)
+        # normalize rewards per rollout (optional, but matches your original code)
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
 
-        adv = torch.zeros(T, dtype=torch.float32)
-        vals = torch.tensor(values + [0.0], dtype=torch.float32)  # bootstrap V_T = 0
+        adv = torch.zeros(T, dtype=torch.float32, device=DEVICE)
+        vals = torch.tensor(values + [0.0], dtype=torch.float32, device=DEVICE)  # bootstrap V_T = 0
         lastgaelam = 0.0
 
         for t in reversed(range(T)):
@@ -355,47 +372,76 @@ class PPO:
         ret = adv + vals[:-1]
         return adv, ret
 
+    # -------------------------------------------------
+    #  PPO UPDATE
+    # -------------------------------------------------
     def ppo_update(self, buffer: RolloutBuffer, actor_critic: ActorCritic):
         """
-        PPO update using fused RGB+Depth features stored in buffer.
+        PPO update using raw RGB+Depth frames stored in buffer.
+
+        Assumes:
+          - buffer.rgb[i]   : (3,H,W)  CPU tensor
+          - buffer.depth[i] : (1,H,W)  CPU tensor (already normalized, e.g. /10)
         """
         T = len(buffer)
+        if T == 0:
+            return
 
-        rgb = torch.stack(buffer.encoded_rgb).to(DEVICE)       # (T, D)
-        depth = torch.stack(buffer.encoded_depth).to(DEVICE)   # (T, D)
+        # --- 1. Stack raw observations ---
+        C, H, W = buffer.rgb[0].shape            # (3,H,W)
+        _, Hd, Wd = buffer.depth[0].shape        # (1,H,W) - H,W should match
 
-        # simple fusion: addition (same dimensionality)
-        fused = torch.cat([rgb, depth], dim=-1)              # (T, D)
-        d = fused.shape[-1]
+        rgb_raw = torch.stack(buffer.rgb, dim=0).to(DEVICE)     # (T,3,H,W)
+        depth_raw = torch.stack(buffer.depth, dim=0).to(DEVICE) # (T,1,H,W)
 
-        fused = fused.view(MINIBATCHES, T // MINIBATCHES, d)   # (B, S, D)
-        actions = torch.tensor(buffer.actions, dtype=torch.long, device=DEVICE)
-        old_logps = torch.tensor(buffer.logps, dtype=torch.float32, device=DEVICE)
+        # --- 2. reshape into (B,S,C,H,W) ---
+        B = MINIBATCHES
+        assert T % B == 0, "T must be divisible by MINIBATCHES"
+        S = T // B
+
+        rgb_raw = rgb_raw.view(B, S, 3, H, W)     # (B,S,3,H,W)
+        depth_raw = depth_raw.view(B, S, 1, H, W) # (B,S,1,H,W)
+
+        # --- 3. Actions / logprobs / returns ---
+        actions = torch.tensor(buffer.actions, dtype=torch.long, device=DEVICE)   # (T,)
+        old_logps = torch.tensor(buffer.logps, dtype=torch.float32, device=DEVICE) # (T,)
 
         advantages, returns = self.compute_gae(buffer.rewards, buffer.values, buffer.dones)
         advantages = advantages.to(dtype=torch.float32, device=DEVICE)
         returns = returns.to(dtype=torch.float32, device=DEVICE)
 
+        # normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+        # --- 4. PPO epochs ---
         for epoch in range(TRAIN_EPOCHS):
-            new_logp, entropy, value_pred = self.evaluate_batch(fused, actions, actor_critic)
+
+            # 4.1 re-encode RGB and depth each epoch (so encoders get gradients every epoch)
+            rgb_encoded = actor_critic.rgb_encoder(rgb_raw)        # (B,S,D)
+            depth_encoded = actor_critic.depth_encoder(depth_raw)  # (B,S,D)
+
+            fused = torch.cat([rgb_encoded, depth_encoded], dim=-1)  # (B,S,2D)
+
+            # 4.2 evaluate batch
+            new_logp, entropy, value_pred = self.evaluate_batch(fused, actions, actor_critic)  # all (T,)
 
             if epoch == TRAIN_EPOCHS - 1:
                 with torch.no_grad():
                     approx_kl = (old_logps - new_logp).mean().item()
                     print("Approx KL Learned:", approx_kl)
 
-            ratio = torch.exp(new_logp - old_logps)
+            # 4.3 PPO objective
+            ratio = torch.exp(new_logp - old_logps)          # (T,)
             surr1 = ratio * advantages
             surr2 = torch.clamp(ratio, 1.0 - PPO_CLIP, 1.0 + PPO_CLIP) * advantages
             policy_loss = -torch.min(surr1, surr2).mean()
 
-            value_loss = F.mse_loss(value_pred.reshape(*returns.shape), returns)
+            value_loss = F.mse_loss(value_pred.reshape_as(returns), returns)
             entropy_bonus = entropy.mean()
 
             loss = policy_loss + VALUE_COEF * value_loss - self.ENTROPY_COEF * entropy_bonus
 
+            # 4.4 optimize
             actor_critic.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(
@@ -414,29 +460,6 @@ class PPO:
                     f"Policy={policy_loss.item():.4f}, "
                     f"Value={value_loss.item():.4f}"
                 )
-
-
-# ---------------------------------------------------------
-#  Teleport helper
-# ---------------------------------------------------------
-def teleport(controller, target=None):
-    event = controller.step("GetReachablePositions")
-    reachable_positions = event.metadata["actionReturn"]
-
-    if target is None:
-        target = np.random.choice(reachable_positions)
-
-    event = controller.step(
-        action="TeleportFull",
-        x=target["x"],
-        y=target["y"],
-        z=target["z"],
-        rotation={"x": 0, "y": 0, "z": 0},
-        horizon=0,
-        standing=True
-    )
-
-    return event
 
 
 # ---------------------------------------------------------
