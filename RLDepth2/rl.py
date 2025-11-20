@@ -609,3 +609,74 @@ class PPOTrainer:
                     f"Entropy={entropy_bonus.item():.4f} "
                     f"KL={approx_kl:.4f}"
                 )
+
+@torch.no_grad()
+def run_inference(
+    actor_critic,
+    env,
+    max_steps=500,
+    deterministic=True,
+    device=DEVICE,
+):
+    """
+    Run a single inference episode.
+    
+    Args:
+        actor_critic : trained ActorCritic model
+        env          : ThorNavEnv with curiosity disabled
+        max_steps    : max steps per episode
+        deterministic: if True -> greedy action (argmax)
+                       if False -> sample from policy
+    """
+    actor_critic.eval()
+
+    # Reset environment and hidden state
+    event = env.reset()
+    h = actor_critic.init_hidden(batch_size=1)
+
+    total_reward = 0.0
+    trajectory = []  # store (frame, action, reward)
+
+    for t in range(max_steps):
+
+        # ---- RGB ----
+        rgb = transform(event.frame.copy()).unsqueeze(0).to(device)
+
+        # ---- Depth ----
+        depth_t = preprocess_depth(event.depth_frame.copy()).to(device)
+        depth_t = depth_t / 10.0
+
+        # ---- Encode ----
+        feat = actor_critic.encode_obs(rgb, depth_t)       # (1, D)
+        feat_seq = feat.unsqueeze(1)                       # (1, 1, D)
+
+        # ---- Get policy ----
+        logits, values, h_new = actor_critic.forward_sequence(feat_seq, h)
+        logits = logits[:, -1, :]     # (1, num_actions)
+        value = values[:, -1]         # (1,)
+
+        if deterministic:
+            action = torch.argmax(logits, dim=-1).item()
+        else:
+            # sample from policy
+            dist = torch.distributions.Categorical(logits=logits)
+            action = dist.sample().item()
+
+        # ---- Step env ----
+        event, reward, done = env.step(action)
+
+        # ---- Save info ----
+        trajectory.append({
+            "frame": event.frame.copy(),
+            "action": action,
+            "reward": reward,
+            "value": float(value.item()),
+        })
+
+        total_reward += reward
+        h = h_new
+
+        if done:
+            break
+
+    return trajectory, total_reward
