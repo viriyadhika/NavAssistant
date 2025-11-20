@@ -232,10 +232,9 @@ class VGGTCuriosity:
     # ----------------------------------------------------
     @torch.no_grad()
     def encode_frame(self, frame_np: np.ndarray) -> torch.Tensor:
-        # Convert frame to (1,1,3,224,224)
         img = frame_np.copy()
-        img = load_and_preprocess_images([img], size=224)   # returns (1,3,224,224)
-        img = img.unsqueeze(0).to(self.device)              # (1,1,3,224,224)
+        img = load_and_preprocess_images([img])   # returns (1,3,224,224)
+        img = img.unsqueeze(0).to(self.device)    # (1,1,3,224,224)
 
         # Run VGGT
         tokens_list, _ = self.model.aggregator(img)
