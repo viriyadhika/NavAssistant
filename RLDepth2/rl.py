@@ -18,6 +18,14 @@ import clip
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 
+def preprocess_depth(depth_np):
+    # depth_np: (H, W) float numpy
+    depth = torch.from_numpy(depth_np.copy()).float()        # (H,W)
+    depth = depth.unsqueeze(0).unsqueeze(0)                  # (1,1,H,W)
+    depth = F.interpolate(depth, size=(224, 224), mode="nearest")
+    depth = depth / 10.0                                     # or your scale
+    return depth
+
 class CLIPCuriosity:
     """
     CLIP-based curiosity:
@@ -151,8 +159,8 @@ class VGGTCuriosity:
         """
 
         # Convert numpy frame → tensor (1, S=1, 3, H, W)
-        img = transform(frame_np).unsqueeze(0).unsqueeze(0).float() / 255.0   # (H,W,3)
-
+        img = transform(frame_np)                    # (3,224,224) float in [0,1]
+        img = img.unsqueeze(0).unsqueeze(0).to(self.device)  # (1,1,3,224,224)
         # Run VGGT aggregator
         # aggregated_tokens_list is a list of stages;
         # we take the final stage [B=1, S=1, D]
@@ -402,7 +410,7 @@ class PPOTrainer:
             rgb = transform(event.frame.copy()).unsqueeze(0).to(self.device)  # [0,1]
 
             # depth frame: numpy (H,W) float
-            depth_t = transform(event.depth_frame.copy()).unsqueeze(0).to(self.device)  # (1,1,H,W)
+            depth_t = preprocess_depth(event.depth_frame.copy()).to(self.device)  # (1,1,H,W)
             depth_t = depth_t / 10.0  # scale to ~[0,10]->[0,1] or adjust
 
             # --- Encode and act ---
