@@ -14,6 +14,7 @@ from PIL import Image
 from cons import DEVICE, GAMMA, GAE_LAMBDA, LR, PPO_CLIP, TRAIN_EPOCHS, VALUE_COEF, ENTROPY_COEF, MAX_GRAD_NORM, EPISODE_STEPS, INTRINSIC_COEF, EXTRINSIC_COEF, ACTIONS, transform
 from models import ActorCritic
 import clip
+import random
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -521,7 +522,7 @@ class ThorNavEnv:
         reachable = event.metadata["actionReturn"]
 
         if init_position is None:
-            target = np.random.choice(reachable)
+            target = random.choice(reachable)
         else:
             target = init_position
 
