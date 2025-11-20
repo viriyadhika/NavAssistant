@@ -15,6 +15,9 @@ from cons import DEVICE, GAMMA, GAE_LAMBDA, LR, PPO_CLIP, TRAIN_EPOCHS, VALUE_CO
 from models import ActorCritic
 import clip
 
+from vggt.models.vggt import VGGT
+from vggt.utils.load_fn import load_and_preprocess_images
+
 class CLIPCuriosity:
     """
     CLIP-based curiosity:
@@ -99,6 +102,122 @@ class CLIPCuriosity:
         self.step_count = 0
 
 
+
+class VGGTCuriosity:
+    """
+    VGGT-based curiosity:
+      - Encodes frames using VGGT aggregator tokens
+      - Computes novelty = 1 - mean(top-k cosine similarity)
+      - Normalizes novelty with running mean/std (EMA)
+      - Drop-in replacement for CLIPCuriosity
+    """
+
+    def __init__(
+        self,
+        device="cuda",
+        buffer_size: int = 10_000,
+        topk: int = 5,
+        ema_beta: float = 0.99,
+        reward_scale: float = 1.0,
+        every_n_steps: int = 1,
+    ):
+        self.device = device
+
+        # Load VGGT (1B parameters)
+        self.model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+        self.model.eval()
+
+        # rolling embedding memory
+        self.buffer = deque(maxlen=buffer_size)
+
+        self.topk = topk
+        self.ema_beta = ema_beta
+        self.reward_scale = reward_scale
+        self.every_n_steps = every_n_steps
+
+        # EMA stats
+        self.novelty_mean = 0.0
+        self.novelty_var = 1.0
+        self.step_count = 0
+
+    # ----------------------------------------------------
+    #  Encode single frame with VGGT aggregator
+    # ----------------------------------------------------
+    @torch.no_grad()
+    def encode_frame(self, frame_np: np.ndarray) -> torch.Tensor:
+        """
+        frame_np: (H, W, 3) uint8
+        Returns:  (D,) normalized VGGT embedding
+        """
+
+        # Convert numpy frame → tensor (1, S=1, 3, H, W)
+        img = torch.from_numpy(frame_np).float() / 255.0   # (H,W,3)
+        img = img.permute(2, 0, 1).unsqueeze(0).unsqueeze(0).to(self.device)
+
+        # Run VGGT aggregator
+        # aggregated_tokens_list is a list of stages;
+        # we take the final stage [B=1, S=1, D]
+        aggregated_tokens_list, _ = self.model.aggregator(img)
+        emb = aggregated_tokens_list[-1].squeeze(0).squeeze(0)  # (D,)
+
+        # Normalize (cosine space)
+        emb = emb / emb.norm(dim=-1, keepdim=True)
+
+        return emb
+
+    # ----------------------------------------------------
+    #  Curiosity reward from VGGT embeddings
+    # ----------------------------------------------------
+    @torch.no_grad()
+    def compute_intrinsic_reward(self, frame_np: np.ndarray) -> float:
+        self.step_count += 1
+
+        # optional step skipping
+        if self.step_count % self.every_n_steps != 0:
+            return 0.0
+
+        # Embed current frame
+        emb = self.encode_frame(frame_np)  # (D,)
+
+        if len(self.buffer) == 0:
+            self.buffer.append(emb)
+            return 0.0
+
+        # Stack past embeddings
+        past = torch.stack(list(self.buffer), dim=0)  # (N, D)
+
+        # cosine similarity to all past embeddings
+        sims = (emb @ past.T)                         # (N,)
+
+        # top-k similarity
+        k = min(self.topk, sims.size(0))
+        topk_sim = torch.topk(sims, k=k, largest=True).values.mean().item()
+
+        novelty = max(0.0, 1.0 - topk_sim)  # in [0,1]
+
+        # ----------------------------------------
+        # EMA normalization (Welford-style)
+        # ----------------------------------------
+        old_mean = self.novelty_mean
+
+        self.novelty_mean = self.ema_beta * self.novelty_mean + (1 - self.ema_beta) * novelty
+        self.novelty_var  = self.ema_beta * self.novelty_var  + (1 - self.ema_beta) * (novelty - self.novelty_mean) ** 2
+
+        std = float(self.novelty_var ** 0.5 + 1e-8)
+
+        normalized = (novelty - self.novelty_mean) / std
+
+        # Update memory
+        self.buffer.append(emb.detach())
+
+        return float(normalized * self.reward_scale)
+
+    # ----------------------------------------------------
+    def reset(self):
+        self.buffer.clear()
+        self.novelty_mean = 0.0
+        self.novelty_var = 1.0
+        self.step_count = 0
 
 class RolloutBuffer:
     def __init__(self):
