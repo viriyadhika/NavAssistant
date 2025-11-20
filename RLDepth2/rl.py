@@ -232,22 +232,30 @@ class VGGTCuriosity:
     # ----------------------------------------------------
     @torch.no_grad()
     def encode_frame(self, frame_np: np.ndarray) -> torch.Tensor:
-        img = frame_np.copy()
-        img = load_and_preprocess_images([img])   # returns (1,3,224,224)
-        img = img.unsqueeze(0).to(self.device)    # (1,1,3,224,224)
+        """
+        frame_np: np array (H, W, 3), uint8
+        returns: 1 vector (D,)
+        """
+        # Convert array to PIL
+        pil_img = Image.fromarray(frame_np)
 
-        # Run VGGT
-        tokens_list, _ = self.model.aggregator(img)
-        tokens = tokens_list[-1]     # (1,1,N,D)
+        # Preprocess into (N, 3, H, W)
+        imgs = load_and_preprocess_images([pil_img], mode="crop").to(self.device)  # (1,3,H,W)
 
-        # Mean-pool over token dimension
-        emb = tokens.mean(dim=2)     # (1,1,D)
-        emb = emb.squeeze(0).squeeze(0)   # (D,)
+        # Add sequence dimension → (1,1,3,H,W)
+        imgs = imgs.unsqueeze(0).to(self.device)
 
-        # Normalize
+        # Run VGGT aggregator
+        tokens_list, _ = self.model.aggregator(imgs)
+        tokens = tokens_list[-1]  # (1,1,N,D)
+
+        # Mean-pool across tokens
+        emb = tokens.mean(dim=2).squeeze(0).squeeze(0)  # (D,)
+
+        # Normalize the embedding
         emb = emb / emb.norm(dim=-1, keepdim=True)
-        return emb
 
+        return emb
     # ----------------------------------------------------
     #  Curiosity reward from VGGT embeddings
     # ----------------------------------------------------
