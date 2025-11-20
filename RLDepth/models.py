@@ -86,7 +86,7 @@ class ConvDepthEncoder(nn.Module):
     Input:  (B, S, 1, H, W)
     Output: (B, S, feat_dim)
     """
-    def __init__(self, feat_dim: int = FEAT_DIM, device: str = DEVICE, chunk_size=256):
+    def __init__(self, feat_dim: int = FEAT_DIM, device: str = DEVICE, chunk_size=32):
         super().__init__()
 
         self.chunk_size = chunk_size

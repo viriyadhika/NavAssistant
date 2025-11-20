@@ -275,8 +275,8 @@ class PPO:
     # -------------------------------------------------
     #  Preprocess RGB from ai2thor event
     # -------------------------------------------------
-    def obs_from_event(self, event):
-        frame = event.frame.copy()
+    def obs_from_event(self, frame_np):
+        frame = frame_np.copy()
         return transform(frame).to(DEVICE)  # (3,H,W) tensor
 
     # -------------------------------------------------
@@ -356,8 +356,6 @@ class PPO:
         T = len(rewards)
 
         rewards = torch.tensor(rewards, dtype=torch.float32, device=DEVICE)
-        # normalize rewards per rollout (optional, but matches your original code)
-        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
 
         adv = torch.zeros(T, dtype=torch.float32, device=DEVICE)
         vals = torch.tensor(values + [0.0], dtype=torch.float32, device=DEVICE)  # bootstrap V_T = 0
@@ -413,12 +411,13 @@ class PPO:
         # normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # --- 4. PPO epochs ---
-        for epoch in range(TRAIN_EPOCHS):
 
-            # 4.1 re-encode RGB and depth each epoch (so encoders get gradients every epoch)
-            rgb_encoded = actor_critic.rgb_encoder(rgb_raw)        # (B,S,D)
+        for epoch in range(TRAIN_EPOCHS):
+            
+            # 4.1 re-encode RGB and depth once (For GPU memory optimization)
             depth_encoded = actor_critic.depth_encoder(depth_raw)  # (B,S,D)
+            rgb_encoded = actor_critic.rgb_encoder(rgb_raw)        # (B,S,D)
+            # --- 4. PPO epochs ---
 
             fused = torch.cat([rgb_encoded, depth_encoded], dim=-1)  # (B,S,2D)
 
@@ -462,6 +461,27 @@ class PPO:
                 )
 
 
+def teleport(controller, target=None):
+    event = controller.step("GetReachablePositions")
+    reachable_positions = event.metadata["actionReturn"]
+    # Pick a random target
+    if target is None:
+        target = np.random.choice(reachable_positions)
+
+    event = controller.step(
+        action="TeleportFull",
+        x=target["x"],
+        y=target["y"],
+        z=target["z"],
+        rotation={"x": 0, "y": 0, "z": 0},
+        horizon=0,
+        standing=True
+    )
+
+    return event
+
+
+
 # ---------------------------------------------------------
 #  Inference / Visualization
 # ---------------------------------------------------------
@@ -487,7 +507,6 @@ def inference(
 
     episode_seq = deque(maxlen=EPISODE_STEPS)
     actions_seq = deque(maxlen=EPISODE_STEPS)
-    raw_obs = []
 
     for t in range(1, n_steps + 1):
 
@@ -497,63 +516,49 @@ def inference(
             event.metadata["agent"]["position"]["z"],
         ])
 
-        # ------------------------------
-        # 1. Encode RGB
-        # ------------------------------
-        rgb_t = ppo.obs_from_event(event)              # (3,H,W)
-        rgb_t = rgb_t.unsqueeze(0).unsqueeze(0)        # (1,1,3,H,W)
+        rgb_frame = ppo.obs_from_event(event.frame)  # (3,H,W)
+
+        # =============================
+        # RAW DEPTH  (normalized)
+        # =============================
+        depth_tensor = ppo.obs_from_event(event.depth_frame) / 10.
+
+        # =============================
+        # Encode for policy (no grad)
+        # =============================
         with torch.no_grad():
-            rgb_embed = actor_critic.rgb_encoder(rgb_t).squeeze(0).squeeze(0)
+            rgb_input = rgb_frame.unsqueeze(0).unsqueeze(0)     # (1,1,3,H,W)
+            depth_input = depth_tensor.unsqueeze(0).unsqueeze(0)  # (1,1,1,H,W)
 
-        # ------------------------------
-        # 2. Encode DEPTH
-        # ------------------------------
-        depth_np = event.depth_frame              # numpy (H,W)
-        depth_t = torch.from_numpy(depth_np.copy()).float()
-        depth_t = depth_t.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # (1,1,1,H,W)
-        depth_t = depth_t.to(DEVICE) / 10
+            rgb_embed = actor_critic.rgb_encoder(rgb_input).squeeze(0).squeeze(0)
+            depth_embed = actor_critic.depth_encoder(depth_input).squeeze(0).squeeze(0)
 
-        with torch.no_grad():
-            depth_embed = actor_critic.depth_encoder(depth_t).squeeze(0).squeeze(0)
+            fused_embed = torch.cat([rgb_embed, depth_embed], dim=-1)
 
-        # ------------------------------
-        # 3. Fuse (RGB + Depth)
-        # ------------------------------
-        fused_embed = torch.cat([rgb_embed, depth_embed], dim=-1)
-
-        raw_obs.append(rgb_t)
-
-        # ------------------------------
-        # 4. Build observation sequence
-        # ------------------------------
+        # Build sequence for transformer
         episode_seq.append(fused_embed)
-
         obs_seq = torch.stack(list(episode_seq), dim=0).unsqueeze(0).to(DEVICE)
-        #         (1, S, 2D)
 
-        # ------------------------------
-        # 5. Build action sequence
-        # ------------------------------
+        # =============================
+        # Action history
+        # =============================
         if len(actions_seq) == 0:
-            # warm start
             actions_seq.append(torch.randint(0, NUM_ACTIONS, ()).item())
 
-        actions_tensor = torch.tensor(list(actions_seq), dtype=torch.long, device=DEVICE)
-        actions_tensor = actions_tensor.unsqueeze(0)  # (1,S)
+        actions_tensor = torch.tensor(list(actions_seq), dtype=torch.long, device=DEVICE).unsqueeze(0)
 
-        # ------------------------------
-        # 6. Actor forward
-        # ------------------------------
+        # =============================
+        # Policy + Value
+        # =============================
         dist = get_distribution(ppo, obs_seq, actions_tensor, actor_critic)
-
         action_idx = dist.sample().item()
-        logp = dist.log_prob(torch.tensor(action_idx, device=DEVICE)).item()
 
-        # ------------------------------
-        # 7. Step environment
-        # ------------------------------
+
+        # =============================
+        # Step environment
+        # =============================
         event, reward = env.step_env(controller, action_idx)
-
+        
         actions_seq.append(action_idx)
 
         # ------------------------------
@@ -580,7 +585,7 @@ def inference(
         plt.grid(True)
         plt.show()
 
-    return raw_obs
+    return episode_seq
 
 
 def inference_video_mp4(
@@ -618,7 +623,7 @@ def inference_video_mp4(
         # 1. Encode RGB
         # -------------------------------------
         with torch.no_grad():
-            rgb_t = ppo.obs_from_event(event)                   # (3,H,W)
+            rgb_t = ppo.obs_from_event(event.frame)                   # (3,H,W)
             rgb_t = rgb_t.unsqueeze(0).unsqueeze(0)             # (1,1,3,H,W)
             rgb_enc = actor_critic.rgb_encoder(rgb_t).squeeze(0).squeeze(0)
 
