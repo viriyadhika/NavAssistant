@@ -153,23 +153,20 @@ class VGGTCuriosity:
     # ----------------------------------------------------
     @torch.no_grad()
     def encode_frame(self, frame_np: np.ndarray) -> torch.Tensor:
-        """
-        frame_np: (H, W, 3) uint8
-        Returns:  (D,) normalized VGGT embedding
-        """
+        # Convert frame to (1,1,3,224,224)
+        img = transform(frame_np)
+        img = img.unsqueeze(0).unsqueeze(0).to(self.device)
 
-        # Convert numpy frame → tensor (1, S=1, 3, H, W)
-        img = transform(frame_np)                    # (3,224,224) float in [0,1]
-        img = img.unsqueeze(0).unsqueeze(0).to(self.device)  # (1,1,3,224,224)
-        # Run VGGT aggregator
-        # aggregated_tokens_list is a list of stages;
-        # we take the final stage [B=1, S=1, D]
-        aggregated_tokens_list, _ = self.model.aggregator(img)
-        emb = aggregated_tokens_list[-1].squeeze(0).squeeze(0)  # (D,)
+        # Run VGGT
+        tokens_list, _ = self.model.aggregator(img)
+        tokens = tokens_list[-1]     # (1,1,N,D)
 
-        # Normalize (cosine space)
+        # Mean-pool over token dimension
+        emb = tokens.mean(dim=2)     # (1,1,D)
+        emb = emb.squeeze(0).squeeze(0)   # (D,)
+
+        # Normalize
         emb = emb / emb.norm(dim=-1, keepdim=True)
-
         return emb
 
     # ----------------------------------------------------
