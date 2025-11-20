@@ -223,6 +223,124 @@ class VGGTCuriosity:
         self.novelty_var = 1.0
         self.step_count = 0
 
+
+class RNDCuriosity(nn.Module):
+    """
+    Random Network Distillation (RND) curiosity module.
+    Computes intrinsic reward = prediction error between:
+      - fixed random target network
+      - trainable predictor network
+
+    Works better than CLIP/VGGT cosine novelty in navigation tasks.
+    """
+
+    def __init__(
+        self,
+        input_shape=(3, 224, 224),   # (C,H,W)
+        emb_dim=256,                 # embedding dimension
+        lr=1e-4,
+        device="cuda",
+        reward_scale=1.0,
+        ema_beta=0.99,
+        every_n_steps=1
+    ):
+        super().__init__()
+        self.device = device
+        self.reward_scale = reward_scale
+        self.ema_beta = ema_beta
+        self.every_n_steps = every_n_steps
+        self.step_count = 0
+
+        C, H, W = input_shape
+
+        # ======== Target network (fixed) ==========
+        self.target = nn.Sequential(
+            nn.Conv2d(C, 32, 8, stride=4), nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, stride=1), nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(64 * 6 * 6, emb_dim),
+            nn.ReLU(),
+        ).to(device)
+
+        # Freeze target completely
+        for p in self.target.parameters():
+            p.requires_grad = False
+
+        # ======== Predictor network (trainable) =======
+        self.predictor = nn.Sequential(
+            nn.Conv2d(C, 32, 8, stride=4), nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, stride=1), nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(64 * 6 * 6, emb_dim),
+            nn.ReLU(),
+        ).to(device)
+
+        # Optimizer for predictor
+        self.optim = torch.optim.Adam(self.predictor.parameters(), lr=lr)
+
+        # Running normalization stats
+        self.r_mean = 0.0
+        self.r_var = 1.0
+
+    # ----------------------------------------------------
+    @torch.no_grad()
+    def preprocess(self, frame):
+        """
+        frame: numpy (H,W,3) uint8
+        Returns normalized torch tensor (1,3,224,224)
+        """
+        img = transform(frame).unsqueeze(0).to(self.device)  # uses your global transform
+        return img  # shape (1,3,224,224)
+
+    # ----------------------------------------------------
+    def compute_intrinsic_reward(self, frame_np):
+        """
+        Returns scalar intrinsic reward.
+        Also trains the predictor network.
+        """
+        self.step_count += 1
+
+        # Skip some frames (optional)
+        if self.step_count % self.every_n_steps != 0:
+            return 0.0
+
+        # Prepare input
+        x = self.preprocess(frame_np)  # (1,3,224,224)
+
+        # ======= Compute embeddings =======
+        with torch.no_grad():
+            target_emb = self.target(x)       # (1,emb_dim)
+
+        pred_emb = self.predictor(x)          # (1,emb_dim)
+
+        # ======= Compute prediction error =======
+        error = F.mse_loss(pred_emb, target_emb, reduction="none").mean(dim=1)  # (1,)
+        error = error.item()  # scalar
+
+        # ======= Online update of predictor =========
+        loss = F.mse_loss(pred_emb, target_emb.detach())
+        self.optim.zero_grad()
+        loss.backward()
+        self.optim.step()
+
+        # ======= Normalize intrinsic reward (EMA) ======
+        old_mean = self.r_mean
+        self.r_mean = self.ema_beta * self.r_mean + (1 - self.ema_beta) * error
+        self.r_var  = self.ema_beta * self.r_var  + (1 - self.ema_beta) * (error - self.r_mean)**2
+
+        std = max(self.r_var ** 0.5, 1e-6)
+        norm_error = (error - self.r_mean) / std
+
+        return float(norm_error * self.reward_scale)
+
+    # ----------------------------------------------------
+    def reset(self):
+        self.step_count = 0
+        self.r_mean = 0.0
+        self.r_var = 1.0
+
 class RolloutBuffer:
     def __init__(self):
         self.feats = []   # list of (feat_dim,) tensors
