@@ -224,116 +224,119 @@ class VGGTCuriosity:
         self.step_count = 0
 
 
-class RNDCuriosity(nn.Module):
+class RNDCuriosity:
     """
-    Random Network Distillation (RND) curiosity module.
-    Computes intrinsic reward = prediction error between:
-      - fixed random target network
-      - trainable predictor network
-
-    Works better than CLIP/VGGT cosine novelty in navigation tasks.
+    Drop-in replacement for CLIPCuriosity / VGGTCuriosity.
+    Uses Random Network Distillation (RND):
+      intrinsic_reward = prediction_error(target(x), predictor(x))
     """
 
     def __init__(
         self,
-        input_shape=(3, 224, 224),   # (C,H,W)
-        emb_dim=256,                 # embedding dimension
-        lr=1e-4,
         device="cuda",
-        reward_scale=1.0,
+        emb_dim=256,
+        lr=1e-4,
         ema_beta=0.99,
-        every_n_steps=1
+        reward_scale=1.0,
+        every_n_steps=1,
     ):
-        super().__init__()
         self.device = device
-        self.reward_scale = reward_scale
+        self.emb_dim = emb_dim
+        self.lr = lr
         self.ema_beta = ema_beta
+        self.reward_scale = reward_scale
         self.every_n_steps = every_n_steps
         self.step_count = 0
 
-        C, H, W = input_shape
+        # ===== Build conv encoder (same for target & predictor) =====
+        self.target = self._build_encoder().to(device)
+        self.predictor = self._build_encoder().to(device)
 
-        # ======== Target network (fixed) ==========
-        self.target = nn.Sequential(
-            nn.Conv2d(C, 32, 8, stride=4), nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2), nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=1), nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(64 * 6 * 6, emb_dim),
-            nn.ReLU(),
-        ).to(device)
-
-        # Freeze target completely
+        # Freeze target
         for p in self.target.parameters():
             p.requires_grad = False
 
-        # ======== Predictor network (trainable) =======
-        self.predictor = nn.Sequential(
-            nn.Conv2d(C, 32, 8, stride=4), nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2), nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=1), nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(64 * 6 * 6, emb_dim),
-            nn.ReLU(),
-        ).to(device)
-
         # Optimizer for predictor
-        self.optim = torch.optim.Adam(self.predictor.parameters(), lr=lr)
+        self.opt = torch.optim.Adam(self.predictor.parameters(), lr=lr)
 
-        # Running normalization stats
+        # Running stats for reward normalization
         self.r_mean = 0.0
         self.r_var = 1.0
 
+        # Compute correct flatten dimension dynamically
+        self.flat_dim = self._get_flat_dim()
+
+        # Replace final linear layers with correct sizes
+        self.target.fc = nn.Linear(self.flat_dim, emb_dim).to(device)
+        self.predictor.fc = nn.Linear(self.flat_dim, emb_dim).to(device)
+
+    # ----------------------------------------------------
+    def _build_encoder(self):
+        """Conv encoder producing some spatial feature map, then flatten + fc."""
+        return nn.Sequential(
+            nn.Conv2d(3, 32, 8, stride=4), nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, stride=1), nn.ReLU(),
+            nn.Flatten(),
+            nn.Identity()   # placeholder for fc replacement
+        )
+
+    # ----------------------------------------------------
+    def _get_flat_dim(self):
+        """Pass a dummy tensor to determine conv flatten size."""
+        dummy = torch.zeros(1, 3, 224, 224)
+        x = self.target[:-1](dummy)    # run without the final fc
+        return x.numel()
+
     # ----------------------------------------------------
     @torch.no_grad()
-    def preprocess(self, frame):
-        """
-        frame: numpy (H,W,3) uint8
-        Returns normalized torch tensor (1,3,224,224)
-        """
-        img = transform(frame).unsqueeze(0).to(self.device)  # uses your global transform
-        return img  # shape (1,3,224,224)
+    def encode_frame(self, frame_np):
+        """Return  embedding from the TARGET network (not predictor)."""
+        x = transform(frame_np).unsqueeze(0).to(self.device)  # (1,3,224,224)
+
+        with torch.no_grad():
+            h = self.target[:-1](x)        # conv → flatten
+            h = h.view(1, -1)
+            emb = self.target.fc(h)        # (1,emb_dim)
+            emb = F.normalize(emb, dim=-1)
+
+        return emb.squeeze(0)              # (emb_dim,)
 
     # ----------------------------------------------------
     def compute_intrinsic_reward(self, frame_np):
-        """
-        Returns scalar intrinsic reward.
-        Also trains the predictor network.
-        """
         self.step_count += 1
 
-        # Skip some frames (optional)
         if self.step_count % self.every_n_steps != 0:
             return 0.0
 
-        # Prepare input
-        x = self.preprocess(frame_np)  # (1,3,224,224)
+        x = transform(frame_np).unsqueeze(0).to(self.device)  # (1,3,224,224)
 
-        # ======= Compute embeddings =======
+        # -------- Target --------------
         with torch.no_grad():
-            target_emb = self.target(x)       # (1,emb_dim)
+            t = self.target[:-1](x).view(1, -1)
+            t = self.target.fc(t)
 
-        pred_emb = self.predictor(x)          # (1,emb_dim)
+        # -------- Predictor -----------
+        p = self.predictor[:-1](x).view(1, -1)
+        p = self.predictor.fc(p)
 
-        # ======= Compute prediction error =======
-        error = F.mse_loss(pred_emb, target_emb, reduction="none").mean(dim=1)  # (1,)
-        error = error.item()  # scalar
+        # -------- Prediction error ----
+        error = F.mse_loss(p, t.detach(), reduction="none").mean()
+        error_val = error.item()
 
-        # ======= Online update of predictor =========
-        loss = F.mse_loss(pred_emb, target_emb.detach())
-        self.optim.zero_grad()
-        loss.backward()
-        self.optim.step()
+        # -------- Train predictor -----
+        self.opt.zero_grad()
+        error.backward()
+        self.opt.step()
 
-        # ======= Normalize intrinsic reward (EMA) ======
-        old_mean = self.r_mean
-        self.r_mean = self.ema_beta * self.r_mean + (1 - self.ema_beta) * error
-        self.r_var  = self.ema_beta * self.r_var  + (1 - self.ema_beta) * (error - self.r_mean)**2
+        # -------- Normalize reward ----
+        self.r_mean = self.ema_beta * self.r_mean + (1 - self.ema_beta) * error_val
+        self.r_var  = self.ema_beta * self.r_var  + (1 - self.ema_beta) * (error_val - self.r_mean)**2
 
-        std = max(self.r_var ** 0.5, 1e-6)
-        norm_error = (error - self.r_mean) / std
+        std = max(self.r_var**0.5, 1e-6)
+        norm_reward = (error_val - self.r_mean) / std
 
-        return float(norm_error * self.reward_scale)
+        return float(norm_reward * self.reward_scale)
 
     # ----------------------------------------------------
     def reset(self):
