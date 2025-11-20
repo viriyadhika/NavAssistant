@@ -15,6 +15,7 @@ from cons import DEVICE, GAMMA, GAE_LAMBDA, LR, PPO_CLIP, TRAIN_EPOCHS, VALUE_CO
 from models import ActorCritic
 import clip
 import random
+from torchvision import transforms as TF
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -227,6 +228,58 @@ class VGGTCuriosity:
         self.novelty_var = 1.0
         self.step_count = 0
 
+    def preprocess_vggt_from_array(self, frame_np, mode="crop", target_size=224):
+        """
+        VGGT-compatible preprocessing directly from numpy array (H,W,3).
+        Returns tensor of shape (1,3,H,W).
+        """
+        # Convert to PIL
+        img = Image.fromarray(frame_np)
+
+        # Ensure RGB
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+
+        width, height = img.size
+
+        if mode == "pad":
+            # Largest dimension → target_size
+            if width >= height:
+                new_width = target_size
+                new_height = round(height * (new_width / width) / 14) * 14
+            else:
+                new_height = target_size
+                new_width = round(width * (new_height / height) / 14) * 14
+
+        else:  # crop (same as official code)
+            new_width = target_size
+            new_height = round(height * (new_width / width) / 14) * 14
+
+        img = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
+
+        # To tensor [0,1]
+        img_t = TF.ToTensor()(img)
+
+        # center crop height if too tall (crop mode only)
+        if mode == "crop" and new_height > target_size:
+            start_y = (new_height - target_size) // 2
+            img_t = img_t[:, start_y:start_y + target_size, :]
+
+        # pad if needed (pad mode)
+        if mode == "pad":
+            h_pad = target_size - img_t.shape[1]
+            w_pad = target_size - img_t.shape[2]
+            if h_pad > 0 or w_pad > 0:
+                pad_top = h_pad // 2
+                pad_bottom = h_pad - pad_top
+                pad_left = w_pad // 2
+                pad_right = w_pad - pad_left
+                img_t = F.pad(img_t,
+                            (pad_left, pad_right, pad_top, pad_bottom),
+                            value=1.0)  # white padding
+
+        return img_t.unsqueeze(0)   # (1,3,H,W)
+
     # ----------------------------------------------------
     #  Encode single frame with VGGT aggregator
     # ----------------------------------------------------
@@ -237,10 +290,9 @@ class VGGTCuriosity:
         returns: 1 vector (D,)
         """
         # Convert array to PIL
-        pil_img = Image.fromarray(frame_np)
 
         # Preprocess into (N, 3, H, W)
-        imgs = load_and_preprocess_images([pil_img], mode="crop").to(self.device)  # (1,3,H,W)
+        imgs = self.preprocess_vggt_from_array(frame_np).to(self.device)  # (1,3,H,W)
 
         # Add sequence dimension → (1,1,3,H,W)
         imgs = imgs.unsqueeze(0).to(self.device)
