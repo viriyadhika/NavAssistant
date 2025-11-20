@@ -203,3 +203,269 @@ class ActorCritic(nn.Module):
         logp = dist.log_prob(action)          # (1,)
 
         return int(action.item()), float(logp.item()), float(value.item()), h_new
+
+class TransformerActorCritic(nn.Module):
+    """
+    Transformer-based Actor-Critic with:
+      - Fused RGB+Depth encoder
+      - Causal Transformer over feature sequences
+      - Policy and value heads
+    API is compatible with your current GRU-based ActorCritic:
+      - encode_obs(rgb, depth) -> (B, feat_dim)
+      - forward_sequence(feats, h0) -> logits, values, hN
+      - act(feat_seq, h) -> action, logp, value, h_new
+    """
+    def __init__(
+        self,
+        feat_dim: int = FEAT_DIM,
+        hidden_dim: int = 256,           # kept for compatibility (used only in init_hidden)
+        num_actions: int = NUM_ACTIONS,
+        n_layers: int = 2,
+        n_heads: int = 4,
+        device: str = DEVICE,
+    ):
+        super().__init__()
+        self.encoder = FusedEncoder(feat_dim, device)
+
+        # Transformer encoder over feature sequences
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=feat_dim,
+            nhead=n_heads,
+            dim_feedforward=4 * feat_dim,
+            batch_first=True,
+        )
+        self.tr = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        # Policy & value heads work on per-timestep transformer outputs
+        self.policy_head = nn.Linear(feat_dim, num_actions)
+        self.value_head = nn.Linear(feat_dim, 1)
+
+        # For PPOTrainer compatibility
+        self.num_actions = num_actions
+        self.hidden_dim = hidden_dim
+        self.device = device
+        self.to(device)
+
+    # -------------------------------------------------
+    #  Hidden state API (kept for PPOTrainer)
+    # -------------------------------------------------
+    def init_hidden(self, batch_size: int = 1) -> torch.Tensor:
+        """
+        GRU-style API for compatibility.
+        Transformer doesn't use h, but PPOTrainer expects a tensor.
+        Shape: (1, B, H)
+        """
+        return torch.zeros(1, batch_size, self.hidden_dim, device=self.device)
+
+    # -------------------------------------------------
+    #  Encode RGB + Depth
+    # -------------------------------------------------
+    def encode_obs(self, rgb: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:
+        """
+        rgb:   (B,3,H,W)
+        depth: (B,1,H,W)
+        returns: (B, feat_dim)
+        """
+        return self.encoder(rgb, depth)
+
+    # -------------------------------------------------
+    #  Forward full sequence (for PPO update)
+    # -------------------------------------------------
+    def forward_sequence(
+        self,
+        feats: torch.Tensor,                 # (B,T,feat_dim)
+        h0: Optional[torch.Tensor] = None,   # ignored, kept for API
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        feats: (B,T,feat_dim)
+        h0:    (1,B,H) or None (ignored)
+        returns:
+            logits: (B,T,num_actions)
+            values: (B,T)
+            hN:     (1,B,H) dummy (zeros)
+        """
+        B, T, D = feats.shape
+        feats = feats.to(self.device)
+
+        # Causal mask: each timestep can only attend to <= t
+        # shape (T,T), with -inf above diagonal
+        mask = torch.full((T, T), float('-inf'), device=self.device)
+        mask = torch.triu(mask, diagonal=1)
+
+        # Transformer encoder
+        z = self.tr(feats, mask=mask)        # (B,T,D)
+
+        logits = self.policy_head(z)         # (B,T,A)
+        values = self.value_head(z).squeeze(-1)  # (B,T)
+
+        # Dummy "next hidden state" for PPOTrainer compatibility
+        hN = self.init_hidden(batch_size=B)
+
+        return logits, values, hN
+
+    # -------------------------------------------------
+    #  Single-step action (for rollout)
+    # -------------------------------------------------
+    def act(
+        self,
+        feat_seq: torch.Tensor,   # (1,1,feat_dim) in your current trainer
+        h: torch.Tensor,          # (1,1,H), ignored
+    ) -> Tuple[int, float, float, torch.Tensor]:
+        """
+        Single-step action interface used in collect_rollout.
+        feat_seq: (1,1,feat_dim)
+        h:        (1,1,H) dummy (ignored)
+        returns:
+            action_idx, logp, value, h_new
+        """
+        logits, values, hN = self.forward_sequence(feat_seq, h0=None)  # logits: (1,1,A)
+        logits = logits[:, -1, :]          # (1,A)
+        value  = values[:, -1]             # (1,)
+
+        dist = Categorical(logits=logits)
+        action = dist.sample()             # (1,)
+        logp = dist.log_prob(action)       # (1,)
+
+        return int(action.item()), float(logp.item()), float(value.item()), hN
+    
+class SlidingWindowTransformerActorCritic(nn.Module):
+    """
+    Actor-Critic with:
+      - Fused RGB+Depth encoder
+      - Sliding-window causal Transformer (length W)
+      - Policy and value heads
+    Drop-in replacement for your current ActorCritic.
+    """
+
+    def __init__(
+        self,
+        feat_dim: int = FEAT_DIM,
+        num_actions: int = NUM_ACTIONS,
+        window: int = 32,
+        n_layers: int = 2,
+        n_heads: int = 4,
+        device: str = DEVICE,
+    ):
+        super().__init__()
+        self.encoder = FusedEncoder(feat_dim, device)
+
+        self.window = window
+        self.feat_dim = feat_dim
+        self.device = device
+
+        # Positional embeddings for window
+        self.pos_embed = nn.Parameter(torch.zeros(1, window, feat_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        # Transformer encoder
+        layer = nn.TransformerEncoderLayer(
+            d_model=feat_dim,
+            nhead=n_heads,
+            dim_feedforward=4 * feat_dim,
+            batch_first=True,
+        )
+        self.tr = nn.TransformerEncoder(layer, num_layers=n_layers)
+
+        # Heads
+        self.policy_head = nn.Linear(feat_dim, num_actions)
+        self.value_head = nn.Linear(feat_dim, 1)
+
+        # For PPO API compatibility
+        self.hidden_dim = feat_dim
+        self.num_actions = num_actions
+        self.to(device)
+
+    # ------------------------------------------------------------------
+    #  Hidden state API (dummy for compatibility)
+    # ------------------------------------------------------------------
+    def init_hidden(self, batch_size: int = 1):
+        return torch.zeros(1, batch_size, self.hidden_dim, device=self.device)
+
+    # ------------------------------------------------------------------
+    #  Encode RGB+Depth to per-step feature vector
+    # ------------------------------------------------------------------
+    def encode_obs(self, rgb, depth):
+        return self.encoder(rgb, depth)
+
+    # ------------------------------------------------------------------
+    #  Sliding window extraction
+    # ------------------------------------------------------------------
+    def _get_window(self, seq):
+        """
+        seq : (B, S, D)
+        Returns: (B, W, D) containing last window frames (padded)
+        """
+        B, S, D = seq.shape
+        W = self.window
+
+        if S >= W:
+            return seq[:, S - W:S, :]
+        else:
+            pad = W - S
+            pad_vec = seq[:, :1, :].repeat(1, pad, 1)
+            return torch.cat([pad_vec, seq], dim=1)
+
+    # ------------------------------------------------------------------
+    #  Full-sequence (for PPO training)
+    # ------------------------------------------------------------------
+    def forward_sequence(self, feats, h0=None):
+        """
+        feats: (B,T,D)
+        returns:
+            logits: (B,T,A)
+            values: (B,T)
+            hN:     dummy
+        """
+        B, T, D = feats.shape
+        feats = feats.to(self.device)
+
+        logits_list = []
+        values_list = []
+
+        for t in range(T):
+            # window over [0..t]
+            win = self._get_window(feats[:, :t+1, :])   # (B,W,D)
+
+            # add positional embeddings
+            win = win + self.pos_embed
+
+            # causal mask
+            mask = torch.full((self.window, self.window), float('-inf'), device=self.device)
+            mask = torch.triu(mask, diagonal=1)
+
+            # transformer
+            z = self.tr(win, mask=mask)   # (B,W,D)
+
+            # last token → output for this timestep
+            token = z[:, -1, :]    # (B,D)
+
+            logits_list.append(self.policy_head(token))
+            values_list.append(self.value_head(token).squeeze(-1))
+
+        logits = torch.stack(logits_list, dim=1)   # (B,T,A)
+        values = torch.stack(values_list, dim=1)   # (B,T)
+
+        hN = self.init_hidden(B)
+        return logits, values, hN
+
+    # ------------------------------------------------------------------
+    #  Act in rollout (single-step)
+    # ------------------------------------------------------------------
+    def act(self, feat_seq, h):
+        """
+        feat_seq: (1,1,D) -- the PPO trainer gives only 1 step at a time
+        """
+        logits, values, hN = self.forward_sequence(feat_seq)
+
+        logits = logits[:, -1, :]   # (1,A)
+        values = values[:, -1]      # (1,)
+
+        dist = Categorical(logits=logits)
+        action = dist.sample()
+
+        return (
+            int(action.item()),
+            float(dist.log_prob(action)),
+            float(values.item()),
+            hN
+        )
