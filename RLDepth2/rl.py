@@ -26,6 +26,84 @@ def preprocess_depth(depth_np):
     depth = depth / 10.0                                     # or your scale
     return depth
 
+
+class ExtrinsicReward:
+    """
+    Keeps last N agent positions and gives reward 
+    based on distance from the sliding-window mean position.
+
+    reward = alpha * || pos_t - mean(last_positions) ||
+
+    If fewer than N positions exist, uses existing ones.
+
+    You can also add optional penalties or bonuses for movement success.
+    """
+
+    def __init__(
+        self,
+        window_size=32,
+        alpha=1.0,
+        fail_penalty=-0.1,
+        move_bonus=0.05
+    ):
+        self.window_size = window_size
+        self.alpha = alpha
+
+        # optional bonuses/penalties
+        self.fail_penalty = fail_penalty
+        self.move_bonus = move_bonus
+
+        # store the last N 2D positions
+        self.positions = deque(maxlen=window_size)
+
+    def reset(self):
+        """Clear window at start of an episode."""
+        self.positions.clear()
+
+    def compute(self, event):
+        """
+        event: AI2-THOR event
+        Returns extrinsic reward based on:
+          (1) novelty movement reward
+          (2) small movement bonus
+          (3) failure penalty
+        """
+
+        # ------------------------
+        #  Extract agent position
+        # ------------------------
+        pos_data = event.metadata["agent"]["position"]
+        pos = np.array([pos_data["x"], pos_data["z"]], dtype=np.float32)
+
+        # ------------------------
+        #  Compute sliding window mean
+        # ------------------------
+        if len(self.positions) == 0:
+            self.positions.append(pos)
+            movement_novelty = 0.0
+        else:
+            mean_pos = np.mean(self.positions, axis=0)
+            movement_novelty = float(np.linalg.norm(pos - mean_pos))
+            self.positions.append(pos)
+
+        # weight the novelty term
+        movement_reward = self.alpha * movement_novelty
+
+        # ------------------------
+        #  Optional action-based terms
+        # ------------------------
+        fail = not event.metadata.get("lastActionSuccess", True)
+        action_str = event.metadata.get("lastAction", "")
+
+        # small failure penalty
+        penalty = self.fail_penalty if fail else 0.0
+
+        # reward for attempted movement
+        bonus = self.move_bonus if "Move" in action_str else 0.0
+
+        return movement_reward + penalty + bonus
+
+
 class CLIPCuriosity:
     """
     CLIP-based curiosity:
@@ -416,12 +494,12 @@ class ThorNavEnv:
         self,
         controller,
         clip_curiosity: CLIPCuriosity,
-        extrinsic_reward_fn=None,
+        extrinsic_reward: ExtrinsicReward,
         pos_bonus_coef: float = 0.01,
     ):
         self.controller = controller
         self.clip_curiosity = clip_curiosity
-        self.extrinsic_reward_fn = extrinsic_reward_fn
+        self.extrinsic_reward = extrinsic_reward
         self.pos_bonus_coef = pos_bonus_coef
 
         self.last_position = None
@@ -471,9 +549,7 @@ class ThorNavEnv:
         intrinsic_r = self.clip_curiosity.compute_intrinsic_reward(event.frame.copy())
 
         # simple extrinsic reward (optional user-defined)
-        extrinsic_r = 0.0
-        if self.extrinsic_reward_fn is not None:
-            extrinsic_r = float(self.extrinsic_reward_fn(event))
+        extrinsic_r = float(self.extrinsic_reward.compute(event))
 
         # small bonus for moving in space
         pos = self._get_position(event)
@@ -615,7 +691,7 @@ def run_inference(
     actor_critic,
     env,
     max_steps=500,
-    deterministic=True,
+    deterministic=False,
     device=DEVICE,
 ):
     """
@@ -671,6 +747,7 @@ def run_inference(
             "action": action,
             "reward": reward,
             "value": float(value.item()),
+            "logits": logits
         })
 
         total_reward += reward
