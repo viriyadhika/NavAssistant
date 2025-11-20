@@ -151,7 +151,7 @@ class VGGTCuriosity:
         """
 
         # Convert numpy frame → tensor (1, S=1, 3, H, W)
-        img = transform(frame_np).unsqueeze(0).float() / 255.0   # (H,W,3)
+        img = transform(frame_np).unsqueeze(0).unsqueeze(0).float() / 255.0   # (H,W,3)
 
         # Run VGGT aggregator
         # aggregated_tokens_list is a list of stages;
