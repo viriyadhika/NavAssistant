@@ -514,6 +514,7 @@ class ThorNavEnv:
         If init_position is None, do a random TeleportFull to a reachable spot.
         """
         self.clip_curiosity.reset()
+        self.extrinsic_reward.reset()
         self.step_count = 0
 
         event = self.controller.step("GetReachablePositions")
@@ -605,7 +606,6 @@ class PPOTrainer:
 
             # depth frame: numpy (H,W) float
             depth_t = preprocess_depth(event.depth_frame.copy()).to(self.device)  # (1,1,H,W)
-            depth_t = depth_t / 10.0  # scale to ~[0,10]->[0,1] or adjust
 
             # --- Encode and act ---
             feat = self.ac.encode_obs(rgb, depth_t)           # (1,D)
@@ -720,7 +720,6 @@ def run_inference(
 
         # ---- Depth ----
         depth_t = preprocess_depth(event.depth_frame.copy()).to(device)
-        depth_t = depth_t / 10.0
 
         # ---- Encode ----
         feat = actor_critic.encode_obs(rgb, depth_t)       # (1, D)
