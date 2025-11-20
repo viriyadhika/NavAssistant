@@ -284,7 +284,7 @@ class RNDCuriosity:
     # ----------------------------------------------------
     def _get_flat_dim(self):
         """Pass a dummy tensor to determine conv flatten size."""
-        dummy = torch.zeros(1, 3, 224, 224)
+        dummy = torch.zeros(1, 3, 224, 224).to(self.device)
         x = self.target[:-1](dummy)    # run without the final fc
         return x.numel()
 
