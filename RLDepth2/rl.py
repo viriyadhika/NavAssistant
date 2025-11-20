@@ -151,8 +151,7 @@ class VGGTCuriosity:
         """
 
         # Convert numpy frame → tensor (1, S=1, 3, H, W)
-        img = torch.from_numpy(frame_np).float() / 255.0   # (H,W,3)
-        img = img.permute(2, 0, 1).unsqueeze(0).unsqueeze(0).to(self.device)
+        img = transform(frame_np).unsqueeze(0).float() / 255.0   # (H,W,3)
 
         # Run VGGT aggregator
         # aggregated_tokens_list is a list of stages;
@@ -403,7 +402,7 @@ class PPOTrainer:
             rgb = transform(event.frame.copy()).unsqueeze(0).to(self.device)  # [0,1]
 
             # depth frame: numpy (H,W) float
-            depth_t = transform(event.depth_frame.copy()).unsqueeze(0).unsqueeze(0).to(self.device)  # (1,1,H,W)
+            depth_t = transform(event.depth_frame.copy()).unsqueeze(0).to(self.device)  # (1,1,H,W)
             depth_t = depth_t / 10.0  # scale to ~[0,10]->[0,1] or adjust
 
             # --- Encode and act ---
