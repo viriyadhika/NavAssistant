@@ -403,9 +403,7 @@ class PPOTrainer:
             rgb = transform(event.frame.copy()).unsqueeze(0).to(self.device)  # [0,1]
 
             # depth frame: numpy (H,W) float
-            depth_np = event.depth_frame
-            depth_t = torch.from_numpy(depth_np.copy()).float()  # (H,W)
-            depth_t = depth_t.unsqueeze(0).unsqueeze(0).to(self.device)  # (1,1,H,W)
+            depth_t = transform(event.depth_frame.copy()).unsqueeze(0).unsqueeze(0).to(self.device)  # (1,1,H,W)
             depth_t = depth_t / 10.0  # scale to ~[0,10]->[0,1] or adjust
 
             # --- Encode and act ---

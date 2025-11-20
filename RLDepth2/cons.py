@@ -39,4 +39,5 @@ ACTIONS = ["MoveAhead", "RotateLeft", "RotateRight"]
 from torchvision import transforms
 transform = transforms.Compose([
     transforms.ToTensor(),   # (H,W,3) -> (3,H,W), [0,1]
+    transforms.Resize((224, 224)),
 ])
