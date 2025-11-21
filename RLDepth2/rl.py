@@ -44,7 +44,7 @@ class ExtrinsicReward:
     def __init__(
         self,
         window_size=32,
-        alpha=3.0,
+        alpha=1.0,
         fail_penalty=-0.1,
         move_bonus=0.05
     ):
@@ -630,8 +630,9 @@ class PPOTrainer:
         device: str = DEVICE,
     ):
         self.ac = actor_critic
-        self.optimizer = torch.optim.Adam([
+        self.optimizer = torch.optim.AdamW([
             {'params': self.ac.gru.parameters(), 'lr': lr * 0.125},
+            {'params': self.ac.encoder.parameters(), 'lr': lr },
             {'params': self.ac.policy_head.parameters(), 'lr': lr},
             {'params': self.ac.value_head.parameters(), 'lr': lr},
         ])
