@@ -50,6 +50,68 @@ class RGBResNetEncoder(nn.Module):
         return f
 
 
+
+class RGBCLIPEncoder(nn.Module):
+    """
+    Frozen CLIP image encoder + projection to FEAT_DIM
+    Input:  (B,3,H,W) in [0,1], ideally 224x224
+    Output: (B, FEAT_DIM)
+    """
+    def __init__(
+        self,
+        feat_dim: int = FEAT_DIM,
+        device: str = DEVICE,
+        model_name: str = "ViT-B/32",   # or "ViT-B/16", "RN50", ...
+    ):
+        super().__init__()
+
+        # Load CLIP model; we only use the image tower
+        clip_model, _ = clip.load(model_name, device=device)
+        self.clip_model = clip_model
+        self.clip_model.eval()
+
+        # Freeze CLIP parameters
+        for p in self.clip_model.parameters():
+            p.requires_grad = False
+
+        # Determine CLIP image embedding dim (e.g. 512 for ViT-B/32)
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, 224, 224, device=device)
+            dummy_emb = self.clip_model.encode_image(dummy)
+            clip_dim = dummy_emb.shape[-1]
+
+        # Projection to desired feature dim
+        self.proj = nn.Linear(clip_dim, feat_dim)
+
+        self.feat_dim = feat_dim
+        self.device = device
+        self.to(device)
+
+        # CLIP normalization constants (from openai/CLIP)
+        self.register_buffer(
+            "mean",
+            torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            "std",
+            torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B,3,H,W), values in [0,1], preferably H=W=224
+        """
+        x = x.to(self.device)
+
+        # CLIP-style normalization
+        x = (x - self.mean) / self.std
+
+        with torch.no_grad():
+            emb = self.clip_model.encode_image(x)   # (B, clip_dim)
+
+        f = self.proj(emb)                          # (B, feat_dim)
+        return f
+
 class DepthEncoder(nn.Module):
     """
     Trainable depth encoder.
@@ -91,7 +153,7 @@ class FusedEncoder(nn.Module):
     """
     def __init__(self, feat_dim: int = FEAT_DIM, device: str = DEVICE):
         super().__init__()
-        self.rgb_encoder = RGBResNetEncoder(feat_dim, device)
+        self.rgb_encoder = RGBCLIPEncoder(feat_dim, device)
         self.depth_encoder = DepthEncoder(feat_dim, device)
 
         self.fusion = nn.Sequential(
