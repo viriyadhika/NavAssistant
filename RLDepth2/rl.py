@@ -746,6 +746,7 @@ class PPOTrainer:
                     )
                 else:
                     with torch.no_grad():
+                        corr = torch.corrcoef(torch.stack([returns.detach(), value_pred.detach()]))[0,1]
                         approx_kl = (old_logps - logps).mean().item()
                         print(
                             f"[PPO] Epoch {ep+1}/{epochs} "
@@ -754,6 +755,7 @@ class PPOTrainer:
                             f"Value={value_loss.item():.4f} "
                             f"Entropy={entropy_bonus.item():.4f} "
                             f"KL={approx_kl:.4f}"
+                            f"Corr={corr:.4f}"
                         )
 
 
