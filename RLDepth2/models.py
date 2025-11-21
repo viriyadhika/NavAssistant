@@ -136,7 +136,7 @@ class ActorCritic(nn.Module):
     ):
         super().__init__()
         self.encoder = FusedEncoder(feat_dim, device)
-        self.gru = nn.GRU(input_size=feat_dim, num_layers=8, hidden_size=hidden_dim, batch_first=True)
+        self.gru = nn.GRU(input_size=feat_dim, num_layers=16, hidden_size=hidden_dim, batch_first=True)
 
         self.policy_head = nn.Linear(hidden_dim, num_actions)
         self.value_head = nn.Linear(hidden_dim, 1)
