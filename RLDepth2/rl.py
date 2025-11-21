@@ -723,23 +723,31 @@ class PPOTrainer:
                 entropy_bonus = entropy.mean()
 
                 loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy_bonus
-                if ep == epochs - 1:
-                    with torch.no_grad():
-                        approx_kl = (old_logps - logps).mean().item()
-
+                    
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(self.ac.parameters(), self.max_grad_norm)
             self.optimizer.step()
 
             if ep == epochs - 1:
-                print(
-                    f"[PPO] Epoch {ep+1}/{epochs} "
-                    f"Loss={loss.item():.4f} "
-                    f"Value={value_loss.item():.4f} "
-                    f"Entropy={entropy_bonus.item():.4f} "
-                    f"KL={approx_kl:.4f}"
-                )
+                if is_pretrain:
+                    print(
+                        f"[PPO] Epoch {ep+1}/{epochs} "
+                        f"Loss={loss.item():.4f} "
+                        f"Value={value_loss.item():.4f} "
+                    )
+                else:
+                    with torch.no_grad():
+                        approx_kl = (old_logps - logps).mean().item()
+                        print(
+                            f"[PPO] Epoch {ep+1}/{epochs} "
+                            f"Loss={loss.item():.4f} "
+                            f"Policy={policy_loss.item():.4f} "
+                            f"Value={value_loss.item():.4f} "
+                            f"Entropy={entropy_bonus.item():.4f} "
+                            f"KL={approx_kl:.4f}"
+                        )
+
 
 @torch.no_grad()
 def run_inference(
