@@ -612,7 +612,7 @@ class ThorNavEnv:
         total_reward = ((
             INTRINSIC_COEF * intrinsic_r +
             EXTRINSIC_COEF * extrinsic_r
-        ) - 0.8) / 20
+        ) - 0.8) / 10
 
         done = False  # you can define a terminal condition if you want
         return event, total_reward, done
@@ -636,14 +636,14 @@ class PPOTrainer:
         #     {'params': self.ac.policy_head.parameters(), 'lr': lr},
         #     {'params': self.ac.value_head.parameters(), 'lr': lr},
         # ])
-        self.optimizer = torch.optim.AdamW(self.ac.parameters())
+        self.optimizer = torch.optim.AdamW(self.ac.parameters(), lr=lr)
         self.clip_eps = clip_eps
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
         self.max_grad_norm = max_grad_norm
         self.device = device
 
-    @torch.no_grad
+    @torch.no_grad()
     def collect_rollout(
         self,
         env: ThorNavEnv,
@@ -740,25 +740,28 @@ class PPOTrainer:
             self.optimizer.step()
 
             if ep == epochs - 1:
+                with torch.no_grad():
+                    corr = torch.corrcoef(torch.stack([returns.detach(), value_pred.detach()]))[0,1]
+                    
                 if is_pretrain:
                     print(
                         f"[PPO] Epoch {ep+1}/{epochs} "
                         f"Loss={loss.item():.4f} "
                         f"Value={value_loss.item():.4f} "
+                        f"Corr={corr:.4f}"
                     )
                 else:
                     with torch.no_grad():
-                        corr = torch.corrcoef(torch.stack([returns.detach(), value_pred.detach()]))[0,1]
                         approx_kl = (old_logps - logps).mean().item()
-                        print(
-                            f"[PPO] Epoch {ep+1}/{epochs} "
-                            f"Loss={loss.item():.4f} "
-                            f"Policy={policy_loss.item():.4f} "
-                            f"Value={value_loss.item():.4f} "
-                            f"Entropy={entropy_bonus.item():.4f} "
-                            f"KL={approx_kl:.4f} "
-                            f"Corr={corr:.4f}"
-                        )
+                    print(
+                        f"[PPO] Epoch {ep+1}/{epochs} "
+                        f"Loss={loss.item():.4f} "
+                        f"Policy={policy_loss.item():.4f} "
+                        f"Value={value_loss.item():.4f} "
+                        f"Entropy={entropy_bonus.item():.4f} "
+                        f"KL={approx_kl:.4f} "
+                        f"Corr={corr:.4f}"
+                    )
 
 
 @torch.no_grad()

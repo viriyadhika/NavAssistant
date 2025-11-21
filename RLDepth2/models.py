@@ -12,6 +12,7 @@ from torch.distributions import Categorical
 import torchvision.models as tv_models
 from PIL import Image
 from cons import DEVICE, FEAT_DIM, NUM_ACTIONS
+import clip
 
 class RGBResNetEncoder(nn.Module):
     """
@@ -90,17 +91,18 @@ class RGBCLIPEncoder(nn.Module):
         # CLIP normalization constants (from openai/CLIP)
         self.register_buffer(
             "mean",
-            torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
+            torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1).half()
         )
         self.register_buffer(
             "std",
-            torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
+            torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1).half()
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: (B,3,H,W), values in [0,1], preferably H=W=224
         """
+        x = x.half()
         x = x.to(self.device)
 
         # CLIP-style normalization
@@ -109,7 +111,7 @@ class RGBCLIPEncoder(nn.Module):
         with torch.no_grad():
             emb = self.clip_model.encode_image(x)   # (B, clip_dim)
 
-        f = self.proj(emb)                          # (B, feat_dim)
+        f = self.proj(emb.float())                  # (B, feat_dim)
         return f
 
 class DepthEncoder(nn.Module):
@@ -407,8 +409,8 @@ class SlidingWindowTransformerActorCritic(nn.Module):
         feat_dim: int = FEAT_DIM,
         num_actions: int = NUM_ACTIONS,
         window: int = 32,
-        n_layers: int = 2,
-        n_heads: int = 4,
+        n_layers: int = 4,
+        n_heads: int = 8,
         device: str = DEVICE,
     ):
         super().__init__()
@@ -444,8 +446,8 @@ class SlidingWindowTransformerActorCritic(nn.Module):
     #  Hidden state API (dummy for compatibility)
     # ------------------------------------------------------------------
     def init_hidden(self, batch_size: int = 1):
-        return torch.zeros(1, batch_size, self.hidden_dim, device=self.device)
-
+        return None
+    
     # ------------------------------------------------------------------
     #  Encode RGB+Depth to per-step feature vector
     # ------------------------------------------------------------------
@@ -518,19 +520,59 @@ class SlidingWindowTransformerActorCritic(nn.Module):
     # ------------------------------------------------------------------
     def act(self, feat_seq, h):
         """
-        feat_seq: (1,1,D) -- the PPO trainer gives only 1 step at a time
+        feat_seq: (1,1,D)   current step feature
+        h      : (1,L,D)    history of previous features, L may be 0 at start
         """
-        logits, values, hN = self.forward_sequence(feat_seq)
+        B, T, D = feat_seq.shape  # expect B=1, T=1
 
-        logits = logits[:, -1, :]   # (1,A)
-        values = values[:, -1]      # (1,)
+        # 1) Append current feature to history → full sequence (1, L+1, D)
+        if h is None or h.size(1) == 0:
+            full_seq = feat_seq           # (1,1,D)
+        else:
+            full_seq = torch.cat([h, feat_seq], dim=1)  # (1, L+1, D)
+
+        # 2) Keep at most last `window` frames
+        if full_seq.size(1) > self.window:
+            hist = full_seq[:, -self.window:, :]        # (1,W,D)
+        else:
+            hist = full_seq                             # (1,L',D), L' <= W
+
+        # 3) Pad on the left if needed to get length W, like _get_window does
+        L = hist.size(1)
+        if L < self.window:
+            pad = self.window - L
+            pad_vec = hist[:, :1, :].repeat(1, pad, 1)  # repeat first real frame
+            win = torch.cat([pad_vec, hist], dim=1)     # (1,W,D)
+        else:
+            win = hist                                  # (1,W,D)
+
+        win = win.to(self.device)
+
+        # 4) Add positional embeddings and causal mask
+        win = win + self.pos_embed                      # (1,W,D)
+
+        mask = torch.full((self.window, self.window), float('-inf'), device=self.device)
+        mask = torch.triu(mask, diagonal=1)
+
+        # 5) Transformer over the window
+        z = self.tr(win, mask=mask)                     # (1,W,D)
+        token = z[:, -1, :]                             # (1,D) last timestep
+
+        logits = self.policy_head(token)                # (1,A)
+        value  = self.value_head(token).squeeze(-1)     # (1,)
 
         dist = Categorical(logits=logits)
-        action = dist.sample()
+        action = dist.sample()                          # (1,)
+        logp   = dist.log_prob(action)                  # (1,)
+
+        # 6) New hidden state is the updated full_seq (clipped to window to keep size bounded)
+        h_new = full_seq.detach()
+        if h_new.size(1) > self.window:
+            h_new = h_new[:, -self.window:, :]
 
         return (
             int(action.item()),
-            float(dist.log_prob(action)),
-            float(values.item()),
-            hN
+            float(logp.item()),
+            float(value.item()),
+            h_new
         )
