@@ -683,41 +683,46 @@ class PPOTrainer:
 
         return buf, total_episode_reward
 
-    def ppo_update(self, buf: RolloutBuffer, epochs: int = TRAIN_EPOCHS, is_pretrain: bool = False):
+    def ppo_update(self, buf, epochs=TRAIN_EPOCHS, is_pretrain=False):
         feats, actions, old_logps, rewards, values, dones = buf.to_tensors(self.device)
-        epochs = TRAIN_EPOCHS * 2 if is_pretrain else TRAIN_EPOCHS
 
-        # reshape to (B=1,T,D) for RNN
-        feats_seq = feats.unsqueeze(0)       # (1,T,D)
-        actions_seq = actions                # (T,)
+        feats_seq = feats.unsqueeze(0)
+        actions_seq = actions
 
         advantages, returns = compute_gae(rewards, values, dones)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+        # If pretraining critic → freeze actor
+        self.ac.policy_head.requires_grad_(not is_pretrain)
+
+        # Expand epochs for warmup
+        if is_pretrain:
+            epochs *= 5
+
         for ep in range(epochs):
-            h0 = self.ac.init_hidden(batch_size=1)
+            h0 = self.ac.init_hidden(1)
 
             logits, value_pred, _ = self.ac.forward_sequence(feats_seq, h0)
-            logits = logits.squeeze(0)       # (T,A)
-            value_pred = value_pred.squeeze(0)  # (T,)
-
-            dist = Categorical(logits=logits)
-            logps = dist.log_prob(actions_seq)  # (T,)
-            entropy = dist.entropy()           # (T,)
-
-            # PPO ratio
-            ratio = torch.exp(logps - old_logps)  # (T,)
-
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages
-            policy_loss = -torch.min(surr1, surr2).mean()
+            logits = logits.squeeze(0)
+            value_pred = value_pred.squeeze(0)
 
             value_loss = F.mse_loss(value_pred, returns)
-            entropy_bonus = entropy.mean()
 
-            loss = self.value_coef * value_loss
-            if not is_pretrain:
-                loss = policy_loss + loss - self.entropy_coef * entropy_bonus
+            if is_pretrain:
+                loss = value_loss
+            else:
+                dist = Categorical(logits=logits)
+                logps = dist.log_prob(actions_seq)
+                entropy = dist.entropy()
+
+                ratio = torch.exp(logps - old_logps)
+                surr1 = ratio * advantages
+                surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * advantages
+
+                policy_loss = -torch.min(surr1, surr2).mean()
+                entropy_bonus = entropy.mean()
+
+                loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy_bonus
 
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
