@@ -711,9 +711,9 @@ class PPOTrainer:
             value_loss = F.mse_loss(value_pred, returns)
             entropy_bonus = entropy.mean()
 
-            loss = self.value_coef * value_loss - self.entropy_coef * entropy_bonus
+            loss = self.value_coef * value_loss
             if not is_pretrain:
-                loss = policy_loss + loss
+                loss = policy_loss + loss - self.entropy_coef * entropy_bonus
 
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
