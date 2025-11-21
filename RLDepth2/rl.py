@@ -624,7 +624,11 @@ class PPOTrainer:
         device: str = DEVICE,
     ):
         self.ac = actor_critic
-        self.optimizer = torch.optim.Adam(self.ac.parameters(), lr=lr)
+        self.optimizer = torch.optim.Adam([
+            {'params': self.ac.gru.parameters(), 'lr': lr * 0.125},
+            {'params': self.ac.policy_head.parameters(), 'lr': lr},
+            {'params': self.ac.value_head.parameters(), 'lr': lr},
+        ])
         self.clip_eps = clip_eps
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
@@ -681,7 +685,7 @@ class PPOTrainer:
 
     def ppo_update(self, buf: RolloutBuffer, epochs: int = TRAIN_EPOCHS, is_pretrain: bool = False):
         feats, actions, old_logps, rewards, values, dones = buf.to_tensors(self.device)
-        epochs = TRAIN_EPOCHS * 5 if is_pretrain else TRAIN_EPOCHS
+        epochs = TRAIN_EPOCHS * 2 if is_pretrain else TRAIN_EPOCHS
 
         # reshape to (B=1,T,D) for RNN
         feats_seq = feats.unsqueeze(0)       # (1,T,D)
