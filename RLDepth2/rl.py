@@ -44,7 +44,7 @@ class ExtrinsicReward:
     def __init__(
         self,
         window_size=32,
-        alpha=1.0,
+        alpha=3.0,
         fail_penalty=-0.1,
         move_bonus=0.05
     ):
@@ -95,15 +95,11 @@ class ExtrinsicReward:
         #  Optional action-based terms
         # ------------------------
         fail = not event.metadata.get("lastActionSuccess", True)
-        action_str = event.metadata.get("lastAction", "")
 
         # small failure penalty
         penalty = self.fail_penalty if fail else 0.0
 
-        # reward for attempted movement
-        bonus = self.move_bonus if "Move" in action_str else 0.0
-
-        return movement_reward + penalty + bonus
+        return movement_reward + penalty
 
 
 class CLIPCuriosity:
@@ -563,12 +559,7 @@ class ThorNavEnv:
         self.extrinsic_reward = extrinsic_reward
         self.pos_bonus_coef = pos_bonus_coef
 
-        self.last_position = None
         self.step_count = 0
-
-    def _get_position(self, event):
-        pos = event.metadata["agent"]["position"]
-        return np.array([pos["x"], pos["z"]], dtype=np.float32)
 
     def reset(self, init_position: dict = None):
         """
@@ -595,7 +586,6 @@ class ThorNavEnv:
             horizon=0,
             standing=True,
         )
-        self.last_position = self._get_position(event)
         return event
 
     def step(self, action_idx: int):
@@ -613,18 +603,10 @@ class ThorNavEnv:
         # simple extrinsic reward (optional user-defined)
         extrinsic_r = float(self.extrinsic_reward.compute(event))
 
-        # small bonus for moving in space
-        pos = self._get_position(event)
-        delta_pos = float(np.linalg.norm(pos - self.last_position))
-        self.last_position = pos
-
-        pos_bonus = self.pos_bonus_coef * delta_pos
-
-        total_reward = (
+        total_reward = ((
             INTRINSIC_COEF * intrinsic_r +
-            EXTRINSIC_COEF * extrinsic_r +
-            pos_bonus
-        )
+            EXTRINSIC_COEF * extrinsic_r
+        ) - 0.8) / 20
 
         done = False  # you can define a terminal condition if you want
         return event, total_reward, done
@@ -675,6 +657,7 @@ class PPOTrainer:
 
             # --- Step env ---
             event, reward, done = env.step(action)
+            done = t == horizon - 1
 
             # --- Store ---
             buf.add(
@@ -696,9 +679,9 @@ class PPOTrainer:
 
         return buf, total_episode_reward
 
-    def ppo_update(self, buf: RolloutBuffer, epochs: int = TRAIN_EPOCHS):
+    def ppo_update(self, buf: RolloutBuffer, epochs: int = TRAIN_EPOCHS, is_pretrain: bool = False):
         feats, actions, old_logps, rewards, values, dones = buf.to_tensors(self.device)
-        T = feats.size(0)
+        epochs = TRAIN_EPOCHS * 5 if is_pretrain else TRAIN_EPOCHS
 
         # reshape to (B=1,T,D) for RNN
         feats_seq = feats.unsqueeze(0)       # (1,T,D)
@@ -728,7 +711,9 @@ class PPOTrainer:
             value_loss = F.mse_loss(value_pred, returns)
             entropy_bonus = entropy.mean()
 
-            loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy_bonus
+            loss = self.value_coef * value_loss - self.entropy_coef * entropy_bonus
+            if not is_pretrain:
+                loss = policy_loss + loss
 
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
