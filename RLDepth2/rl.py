@@ -723,6 +723,9 @@ class PPOTrainer:
                 entropy_bonus = entropy.mean()
 
                 loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy_bonus
+                if ep == epochs - 1:
+                    with torch.no_grad():
+                        approx_kl = (old_logps - logps).mean().item()
 
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -730,8 +733,6 @@ class PPOTrainer:
             self.optimizer.step()
 
             if ep == epochs - 1:
-                with torch.no_grad():
-                    approx_kl = (old_logps - logps).mean().item()
                 print(
                     f"[PPO] Epoch {ep+1}/{epochs} "
                     f"Loss={loss.item():.4f} "
