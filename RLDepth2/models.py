@@ -135,8 +135,9 @@ class ActorCritic(nn.Module):
         device: str = DEVICE,
     ):
         super().__init__()
+        self.num_layers = 16
         self.encoder = FusedEncoder(feat_dim, device)
-        self.gru = nn.GRU(input_size=feat_dim, num_layers=16, hidden_size=hidden_dim, batch_first=True)
+        self.gru = nn.GRU(input_size=feat_dim, num_layers=self.num_layers, hidden_size=hidden_dim, batch_first=True)
 
         self.policy_head = nn.Linear(hidden_dim, num_actions)
         self.value_head = nn.Linear(hidden_dim, 1)
@@ -146,11 +147,11 @@ class ActorCritic(nn.Module):
         self.device = device
         self.to(device)
 
-    def init_hidden(self, batch_size: int = 1) -> torch.Tensor:
+    def init_hidden(self, batch_size: int = 1, seq_size: int = None) -> torch.Tensor:
         """
         Returns initial hidden state for GRU: (1, B, H)
         """
-        return torch.zeros(1, batch_size, self.hidden_dim, device=self.device)
+        return torch.zeros(self.num_layers, batch_size, self.hidden_dim, device=self.device)
 
     def encode_obs(self, rgb: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:
         """

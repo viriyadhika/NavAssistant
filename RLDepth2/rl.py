@@ -487,8 +487,10 @@ class RolloutBuffer:
         self.rewards = []
         self.values = []
         self.dones = []
+        self.rgb = []
+        self.depth = []
 
-    def add(self, feat, action, logp, reward, value, done):
+    def add(self, feat, action, logp, reward, value, done, rgb, depth):
         # feat: (feat_dim,) on CPU or GPU
         self.feats.append(feat.detach().cpu())
         self.actions.append(int(action))
@@ -496,6 +498,8 @@ class RolloutBuffer:
         self.rewards.append(float(reward))
         self.values.append(float(value))
         self.dones.append(bool(done))
+        self.rgb.append(rgb)
+        self.depth.append(depth)
 
     def __len__(self):
         return len(self.rewards)
@@ -507,7 +511,9 @@ class RolloutBuffer:
         rewards = torch.tensor(self.rewards, dtype=torch.float32, device=device)  # (T,)
         values = torch.tensor(self.values, dtype=torch.float32, device=device)    # (T,)
         dones = torch.tensor(self.dones, dtype=torch.float32, device=device)      # (T,)
-        return feats, actions, logps, rewards, values, dones
+        rgb = torch.cat(self.rgb, dim=0).to(device)
+        depth = torch.cat(self.depth, dim=0).to(device)
+        return feats, actions, logps, rewards, values, dones, rgb, depth
 
 
 def compute_gae(
@@ -671,6 +677,8 @@ class PPOTrainer:
                 reward=reward,
                 value=value,
                 done=done,
+                rgb=rgb,
+                depth=depth_t
             )
 
             total_episode_reward += reward
@@ -683,10 +691,8 @@ class PPOTrainer:
 
         return buf, total_episode_reward
 
-    def ppo_update(self, buf, epochs=TRAIN_EPOCHS, is_pretrain=False):
-        feats, actions, old_logps, rewards, values, dones = buf.to_tensors(self.device)
-
-        feats_seq = feats.unsqueeze(0)
+    def ppo_update(self, buf: RolloutBuffer, epochs=TRAIN_EPOCHS, is_pretrain=False):
+        feats, actions, old_logps, rewards, values, dones, rgb, depth = buf.to_tensors(self.device)
         actions_seq = actions
 
         advantages, returns = compute_gae(rewards, values, dones)
@@ -700,10 +706,11 @@ class PPOTrainer:
             epochs *= 5
 
         for ep in range(epochs):
+            feats_seq = self.ac.encode_obs(rgb, depth)
             h0 = self.ac.init_hidden(1)
 
-            logits, value_pred, _ = self.ac.forward_sequence(feats_seq, h0)
-            logits = logits.squeeze(0)
+            logits, value_pred, _ = self.ac.forward_sequence(feats_seq.unsqueeze(0), h0)
+            logits = logits.squeeze(0) 
             value_pred = value_pred.squeeze(0)
 
             value_loss = F.mse_loss(value_pred, returns)
