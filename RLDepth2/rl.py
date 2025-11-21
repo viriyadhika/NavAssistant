@@ -630,18 +630,20 @@ class PPOTrainer:
         device: str = DEVICE,
     ):
         self.ac = actor_critic
-        self.optimizer = torch.optim.AdamW([
-            {'params': self.ac.gru.parameters(), 'lr': lr * 0.125},
-            {'params': self.ac.encoder.parameters(), 'lr': lr },
-            {'params': self.ac.policy_head.parameters(), 'lr': lr},
-            {'params': self.ac.value_head.parameters(), 'lr': lr},
-        ])
+        # self.optimizer = torch.optim.AdamW([
+        #     {'params': self.ac.gru.parameters(), 'lr': lr * 0.125},
+        #     {'params': self.ac.encoder.parameters(), 'lr': lr },
+        #     {'params': self.ac.policy_head.parameters(), 'lr': lr},
+        #     {'params': self.ac.value_head.parameters(), 'lr': lr},
+        # ])
+        self.optimizer = torch.optim.AdamW(self.ac.parameters())
         self.clip_eps = clip_eps
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
         self.max_grad_norm = max_grad_norm
         self.device = device
 
+    @torch.no_grad
     def collect_rollout(
         self,
         env: ThorNavEnv,
@@ -754,7 +756,7 @@ class PPOTrainer:
                             f"Policy={policy_loss.item():.4f} "
                             f"Value={value_loss.item():.4f} "
                             f"Entropy={entropy_bonus.item():.4f} "
-                            f"KL={approx_kl:.4f}"
+                            f"KL={approx_kl:.4f} "
                             f"Corr={corr:.4f}"
                         )
 
