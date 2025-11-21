@@ -736,7 +736,6 @@ class PPOTrainer:
                 print(
                     f"[PPO] Epoch {ep+1}/{epochs} "
                     f"Loss={loss.item():.4f} "
-                    f"Policy={policy_loss.item():.4f} "
                     f"Value={value_loss.item():.4f} "
                     f"Entropy={entropy_bonus.item():.4f} "
                     f"KL={approx_kl:.4f}"
