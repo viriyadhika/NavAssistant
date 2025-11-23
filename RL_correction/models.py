@@ -77,7 +77,77 @@ class FrozenResNetEncoder(nn.Module):
         # Restore original shape
         return feats.view(b, s, self.feat_dim) # (B, S, feat_dim)
     
+class SmallCNNEncoder(nn.Module):
+    """
+    A small CNN encoder that outputs (B, S, feat_dim).
+    Fully trainable, chunk-friendly, and avoids dummy pass.
+    """
+    def __init__(self, feat_dim: int, IMG_SIZE: int = IMG_SIZE,
+                 device: str = "cuda", chunk_size: int = 32):
+        super().__init__()
 
+        self.IMG_SIZE = IMG_SIZE
+        self.chunk_size = chunk_size
+        self.device = device
+        self.feat_dim = feat_dim
+
+        # Same conv layout as before
+        self.cnn = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=8, stride=4),  # -> (32, H1, W1)
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2), # -> (64, H2, W2)
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1), # -> (64, H3, W3)
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+
+        # Compute final feature dimension analytically
+        self.cnn_out_dim = self._compute_cnn_output_dim(IMG_SIZE)
+
+        self.proj = nn.Linear(self.cnn_out_dim, feat_dim)
+
+        self.to(device)
+
+    def _conv_out(self, size, kernel, stride, padding=0):
+        """Compute output size of a conv layer."""
+        return (size - kernel + 2*padding) // stride + 1
+
+    def _compute_cnn_output_dim(self, size):
+        """
+        Compute output dimension of the final flattened CNN output.
+        CNN:
+        Conv(8x8, s4)
+        Conv(4x4, s2)
+        Conv(3x3, s1)
+        """
+        # Layer 1
+        h1 = self._conv_out(size, kernel=8, stride=4)
+        # Layer 2
+        h2 = self._conv_out(h1, kernel=4, stride=2)
+        # Layer 3
+        h3 = self._conv_out(h2, kernel=3, stride=1)
+
+        # Final channels = 64
+        return 64 * h3 * h3
+
+    def forward(self, x):
+        """
+        x: (B, S, C, H, W)
+        returns: (B, S, feat_dim)
+        """
+        B, S, C, H, W = x.shape
+        x = x.reshape(B * S, C, H, W)  # flatten sequence dim
+
+        feats = []
+        for i in range(0, B * S, self.chunk_size):
+            chunk = x[i:i+self.chunk_size].to(self.device)
+            f = self.cnn(chunk)      # (chunk, cnn_out_dim)
+            f = self.proj(f)         # (chunk, feat_dim)
+            feats.append(f)
+
+        feats = torch.cat(feats, dim=0)
+        return feats.view(B, S, self.feat_dim)
 
 class LSTMActor(nn.Module):
     def __init__(self, feat_dim: int, num_actions: int, truncation_len=32):
