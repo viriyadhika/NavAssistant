@@ -196,10 +196,9 @@ class SlidingWindowTransformer(nn.Module):
         self.tr = nn.TransformerEncoder(layer, num_layers=n_layers)
 
         self.num_output = num_output
-
         self.action_head = nn.Linear(feat_dim, num_output)
 
-    def forward(self, X, action_seq, mask):
+    def forward(self, X, action_seq, mask, chunk_size=64):
         """
         X: (B, S, D)
         """
@@ -207,49 +206,63 @@ class SlidingWindowTransformer(nn.Module):
         W = self.window
 
         # -------------------------------------------------
-        # 1) Build index matrix for sliding windows
+        # 1) Build sliding index matrix (S, W)
         # -------------------------------------------------
-        idx = torch.arange(S, device=X.device)  # (S,)
-        idx = idx.unsqueeze(1) - torch.arange(W, device=X.device)  # (S, W)
-        # idx[t] = [t-0, t-1, t-2, ... t-(W-1)]
+        idx = torch.arange(S, device=X.device).unsqueeze(1) - torch.arange(W, device=X.device)
+        idx = idx.clamp(min=0)   # early timesteps repeat frame 0
 
-        # clamp for t < W
-        idx = idx.clamp(min=0)  # So early timesteps repeat frame 0
-
-        # -------------------------------------------------
-        # 2) Gather windows in one shot
-        # -------------------------------------------------
-        # X: (B, S, D)
-        # idx: (S, W)
-        windows = X[:, idx, :]   # → (B, S, W, D)
+        # this will accumulate outputs for all S windows
+        outputs = []
 
         # -------------------------------------------------
-        # 3) Add positional embedding for each window
+        # Chunked sliding window processing
         # -------------------------------------------------
-        windows = windows + self.pos_embed[:, :W, :]   # broadcasted
+        for start in range(0, S, chunk_size):
+            end = min(start + chunk_size, S)
+
+            # (C, W)
+            idx_chunk = idx[start:end]
+
+            # -------------------------------------------------
+            # 2) Gather windows: (B, C, W, D)
+            # -------------------------------------------------
+            windows = X[:, idx_chunk, :]  # broadcasting idx_chunk
+
+            # -------------------------------------------------
+            # 3) Add positional embedding
+            # -------------------------------------------------
+            windows = windows + self.pos_embed[:, :W, :]
+
+            # -------------------------------------------------
+            # 4) Flatten windows → (B*C, W, D)
+            # -------------------------------------------------
+            BC = B * (end - start)
+            windows = windows.reshape(BC, W, D)
+
+            # -------------------------------------------------
+            # 5) Transformer on chunk
+            # -------------------------------------------------
+            out = self.tr(windows)  # (B*C, W, D)
+
+            # last token only
+            last = out[:, -1, :]    # (B*C, D)
+
+            # reshape back → (B, C, D)
+            last = last.reshape(B, end - start, D)
+
+            outputs.append(last)
 
         # -------------------------------------------------
-        # 4) Flatten so transformer sees independent windows
+        # 6) Concatenate across all chunks → (B, S, D)
         # -------------------------------------------------
-        windows = windows.reshape(B * S, W, D)   # (B*S, W, D)
+        final = torch.cat(outputs, dim=1)
 
         # -------------------------------------------------
-        # 5) Run transformer ONCE
+        # 7) Action head → (B, S, num_output)
         # -------------------------------------------------
-        out = self.tr(windows)  # (B*S, W, D)
+        logits = self.action_head(final)
 
-        # take last token of each window
-        last = out[:, -1, :]    # (B*S, D)
-
-        # -------------------------------------------------
-        # 6) Reshape back to (B, S, D)
-        # -------------------------------------------------
-        last = last.reshape(B, S, D)
-
-        # -------------------------------------------------
-        # 7) Action head → (B, S, num_actions)
-        # -------------------------------------------------
-        logits = self.action_head(last)
+        # follow your template behavior exactly
         return logits.view(B * S, self.num_output)
 
 class SlidingWindowTransformerActor(SlidingWindowTransformer):
