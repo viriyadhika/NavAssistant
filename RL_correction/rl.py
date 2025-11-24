@@ -381,9 +381,8 @@ def teleport(controller, target=None):
     return event
 
 
-
 def inference(
-        get_distribution: Callable[[torch.Tensor, torch.Tensor, ActorCritic], torch.distributions.Categorical],
+        get_distribution: Callable[[torch.Tensor, torch.Tensor, ActorCritic], torch.distributions.Categorical], 
         controller,
         ppo: PPO,
         init_position: dict[str, float], 
@@ -405,13 +404,13 @@ def inference(
         with torch.no_grad():
             obs_t = ppo.obs_from_event(event)  # (C,H,W)
             obs_t_encoded = actor_critic.actor_critic_encoder(obs_t.unsqueeze(0).unsqueeze(0)).squeeze(0).squeeze(0)
-            obs_seq = torch.stack(list(episode_seq) + [obs_t_encoded], dim=0).unsqueeze(0).to(device=DEVICE)
+            obs_seq = torch.stack(list(episode_seq) + [obs_t_encoded], dim=0).to(device=DEVICE)
 
         if len(actions_seq) == 0:
             actions_seq.append(torch.randint(0, NUM_ACTIONS, (1, 1)).item())
         
         actions_tensor = torch.tensor(actions_seq, dtype=torch.long, device=DEVICE).unsqueeze(0)
-        dist = get_distribution(ppo, obs_seq, actions_tensor, actor_critic)
+        dist = get_distribution(obs_seq, actions_tensor, actor_critic)
         action_idx = dist.sample()
         logp = dist.log_prob(action_idx)
         
@@ -449,12 +448,12 @@ def inference_video_mp4(
     get_distribution: Callable[[PPO, torch.Tensor, torch.Tensor, ActorCritic], torch.distributions.Categorical],
     controller,
     ppo: PPO,
-    init_position: dict[str, float], 
-    env: Env, 
-    actor_critic: ActorCritic, 
+    init_position: dict[str, float],
+    env: Env,
+    actor_critic: ActorCritic,
     video_path="rollout.mp4",
     fps=10,
-    n_steps=512
+    n_steps=256
 ):
     episode_seq = deque(maxlen=EPISODE_STEPS)
     actions_seq = deque(maxlen=EPISODE_STEPS)
@@ -484,7 +483,7 @@ def inference_video_mp4(
 
             obs_seq = torch.stack(
                 list(episode_seq) + [obs_enc], dim=0
-            ).unsqueeze(0).to(DEVICE)
+            ).to(DEVICE)
 
         # ---- Action ----
         if len(actions_seq) == 0:
@@ -494,7 +493,7 @@ def inference_video_mp4(
             actions_seq, dtype=torch.long, device=DEVICE
         ).unsqueeze(0)
 
-        dist = get_distribution(ppo, obs_seq, actions_tensor, actor_critic)
+        dist = get_distribution(obs_seq, actions_tensor, actor_critic)
         action_idx = dist.sample().item()
 
         # ---- Step env ----
@@ -508,4 +507,3 @@ def inference_video_mp4(
     print(f"[🎞️] Saved video to {video_path}")
 
     return positions
-
