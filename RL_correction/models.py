@@ -319,101 +319,106 @@ class LSTMCritic(nn.Module):
         logits = self.head(outputs.reshape(B * S, D))
         return logits
 
+class SinusoidalPositionalEmbedding(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
 
-class SlidingWindowTransformer(nn.Module):
-    def __init__(self, feat_dim: int, num_output: int, window=32, n_layers=4, n_heads=8):
+    def forward(self, B: int, S: int, device):
+        """
+        Returns (B, S, dim) sinusoidal positional encodings.
+        """
+        position = torch.arange(S, device=device).unsqueeze(1)              # (S, 1)
+        div_term = torch.exp(
+            torch.arange(0, self.dim, 2, device=device) *
+            (-torch.log(torch.tensor(10000.0, device=device)) / self.dim)
+        )                                                                    # (dim/2,)
+
+        pe = torch.zeros(S, self.dim, device=device)                         # (S, dim)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        return pe.unsqueeze(0).expand(B, S, self.dim)
+
+class LocalWindowTransformer(nn.Module):
+    """
+    Causal local-attention transformer:
+      - Input:  X (B, S, D)
+      - Each position attends only to the last `window` positions (including itself)
+      - Output: logits (B*S, num_output)  -- matches your original API
+    """
+    def __init__(self, feat_dim: int, num_output: int,
+                 window: int = 32, n_layers: int = 4, n_heads: int = 8):
         super().__init__()
         self.window = window
+        self.feat_dim = feat_dim
 
-        self.pos_embed = nn.Parameter(torch.zeros(1, window, feat_dim))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        # Positional encoding (works for any S)
+        self.pos_embed = SinusoidalPositionalEmbedding(feat_dim)
 
         layer = nn.TransformerEncoderLayer(
             d_model=feat_dim,
             nhead=n_heads,
             dim_feedforward=4 * feat_dim,
-            batch_first=True
+            batch_first=True,      # so Transformer sees (B, S, D)
         )
         self.tr = nn.TransformerEncoder(layer, num_layers=n_layers)
 
         self.num_output = num_output
         self.action_head = nn.Linear(feat_dim, num_output)
 
-    def forward(self, X, action_seq, mask, chunk_size=64):
+    def build_local_causal_mask(self, S: int, device):
+        """
+        Returns a boolean mask of shape (S, S):
+          True  => position is MASKED (disallowed)
+          False => allowed
+        Enforces:
+          - causal (no attending to future positions)
+          - local window of size `self.window`
+        """
+        idx = torch.arange(S, device=device)
+        i = idx.unsqueeze(1)  # (S, 1) target positions
+        j = idx.unsqueeze(0)  # (1, S) source positions
+
+        # Disallow attention to:
+        too_future = j > i                    # j > i  => future
+        too_past  = (i - j) >= self.window    # i - j >= W  => older than W-1
+
+        mask = too_future | too_past          # (S, S) boolean
+        return mask
+
+    def forward(self, X, action_seq=None, mask=None):
         """
         X: (B, S, D)
+        action_seq, mask: kept for API compatibility (ignored here)
+        Returns: (B*S, num_output)
         """
         B, S, D = X.shape
-        W = self.window
+        device = X.device
 
-        # -------------------------------------------------
-        # 1) Build sliding index matrix (S, W)
-        # -------------------------------------------------
-        idx = torch.arange(S, device=X.device).unsqueeze(1) - torch.arange(W, device=X.device)
-        idx = idx.clamp(min=0)   # early timesteps repeat frame 0
+        # Add positional embeddings
+        pos = self.pos_embed(B, S, device)    # (B, S, D)
+        X = X + pos
 
-        # this will accumulate outputs for all S windows
-        outputs = []
+        # Local causal attention mask: (S, S)
+        attn_mask = self.build_local_causal_mask(S, device)
 
-        # -------------------------------------------------
-        # Chunked sliding window processing
-        # -------------------------------------------------
-        for start in range(0, S, chunk_size):
-            end = min(start + chunk_size, S)
+        # Transformer over full sequence with local attention
+        out = self.tr(X, mask=attn_mask)      # (B, S, D)
 
-            # (C, W)
-            idx_chunk = idx[start:end]
+        # Project to actions
+        logits = self.action_head(out)        # (B, S, num_output)
 
-            # -------------------------------------------------
-            # 2) Gather windows: (B, C, W, D)
-            # -------------------------------------------------
-            windows = X[:, idx_chunk, :]  # broadcasting idx_chunk
-
-            # -------------------------------------------------
-            # 3) Add positional embedding
-            # -------------------------------------------------
-            windows = windows + self.pos_embed[:, :W, :]
-
-            # -------------------------------------------------
-            # 4) Flatten windows → (B*C, W, D)
-            # -------------------------------------------------
-            BC = B * (end - start)
-            windows = windows.reshape(BC, W, D)
-
-            # -------------------------------------------------
-            # 5) Transformer on chunk
-            # -------------------------------------------------
-            out = self.tr(windows)  # (B*C, W, D)
-
-            # last token only
-            last = out[:, -1, :]    # (B*C, D)
-
-            # reshape back → (B, C, D)
-            last = last.reshape(B, end - start, D)
-
-            outputs.append(last)
-
-        # -------------------------------------------------
-        # 6) Concatenate across all chunks → (B, S, D)
-        # -------------------------------------------------
-        final = torch.cat(outputs, dim=1)
-
-        # -------------------------------------------------
-        # 7) Action head → (B, S, num_output)
-        # -------------------------------------------------
-        logits = self.action_head(final)
-
-        # follow your template behavior exactly
         return logits.view(B * S, self.num_output)
 
-class SlidingWindowTransformerActor(SlidingWindowTransformer):
+class SlidingWindowTransformerActor(LocalWindowTransformer):
     def __init__(self, feat_dim, num_actions, window=32, n_layers=4, n_heads=8):
         super().__init__(feat_dim, num_actions, window, n_layers, n_heads)
 
     def forward(self, X, action_seq, mask):
         return super().forward(X, action_seq, mask)
 
-class SlidingWindowTransformerCritic(SlidingWindowTransformer):
+class SlidingWindowTransformerCritic(LocalWindowTransformer):
     def __init__(self, feat_dim, window=32, n_layers=4, n_heads=8):
         super().__init__(feat_dim, 1, window, n_layers, n_heads)
 

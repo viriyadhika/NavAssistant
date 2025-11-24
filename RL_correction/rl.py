@@ -156,8 +156,9 @@ class ClipEnv(Env):
         # --- Small bonus for moving away from recent average ---
         pos_bonus = np.linalg.norm(pos - avg_pos) / 2  # ~0–0.1 scale
         self.last_action = action_str
+        fail_penalty = 0 if event.metadata["lastActionSuccess"] else -0.2
 
-        return event, 3 * reward + pos_bonus
+        return event, 3 * reward + pos_bonus + fail_penalty
     
     def reset(self):
         self.clip_novelty.reset()
