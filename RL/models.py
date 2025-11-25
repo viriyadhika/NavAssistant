@@ -14,7 +14,7 @@ class FrozenResNetEncoder(nn.Module):
     Frozen pretrained ResNet encoder that outputs (B, S, feat_dim)
     but processes frames in chunks to avoid GPU OOM.
     """
-    def __init__(self, feat_dim: int = FEAT_DIM, device: str = DEVICE, chunk_size: int = 32):
+    def __init__(self, feat_dim: int = FEAT_DIM, device: str = DEVICE, chunk_size: int = 32, project_to_out_dim=True):
         super().__init__()
 
         # Use small ResNet backbone
@@ -22,7 +22,8 @@ class FrozenResNetEncoder(nn.Module):
 
         # Remove classification head
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])  # -> (B, 512, 1, 1)
-        self.backbone.eval()  
+        self.backbone.eval()
+        self.project_to_out_dim = project_to_out_dim
 
         # Freeze everything
         for p in self.backbone.parameters():
@@ -68,15 +69,57 @@ class FrozenResNetEncoder(nn.Module):
                 f = f.flatten(1)            # (chunk, 512)
 
             # Project to feat_dim
-            f = self.proj(f)                # (chunk, feat_dim)
+            if self.project_to_out_dim:
+                f = self.proj(f)                # (chunk, feat_dim)
+            
             feats_list.append(f)
 
         # Concat chunk outputs
         feats = torch.cat(feats_list, dim=0)    # (B*S, feat_dim)
 
         # Restore original shape
-        return feats.view(b, s, self.feat_dim)
+        _, d = feats.shape
+        return feats.view(b, s, d)
     
+
+class FrozenResNetPCAEncoder(nn.Module):
+    def __init__(self, feat_dim, pca_matrix, device="cuda", chunk_size=32):
+        super().__init__()
+        resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
+        self.backbone.eval()
+
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+        self.register_buffer("pca_matrix", pca_matrix)  # (feat_dim, 512)
+
+        # imagenet normalization
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1))
+
+        self.chunk_size = chunk_size
+        self.feat_dim = feat_dim
+        self.device = device
+
+    def forward(self, x):
+        B, S, C, H, W = x.shape
+        x = x.reshape(B*S, C, H, W)
+
+        feats = []
+        for i in range(0, B*S, self.chunk_size):
+            chunk = x[i:i+self.chunk_size]
+            chunk = (chunk - self.mean) / self.std
+
+            with torch.no_grad():
+                f = self.backbone(chunk).flatten(1)  # (N, 512)
+
+            # PCA projection
+            f = f @ self.pca_matrix.T   # (N, feat_dim)
+            feats.append(f)
+
+        feats = torch.cat(feats, 0)
+        return feats.view(B, S, self.feat_dim)
 
 
 class LSTMActor(nn.Module):

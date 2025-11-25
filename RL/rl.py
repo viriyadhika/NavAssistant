@@ -386,9 +386,9 @@ def inference(
         init_position: dict[str, float], 
         env: Env, 
         actor_critic: ActorCritic, 
-        plot=True
+        plot=True,
+        n=256
     ):
-    n = 256
     n_row = 32
     positions = []
 
