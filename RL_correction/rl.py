@@ -382,7 +382,7 @@ def teleport(controller, target=None):
 
 
 def inference(
-        get_distribution: Callable[[torch.Tensor, torch.Tensor, ActorCritic], torch.distributions.Categorical], 
+        get_distribution: Callable[[PPO, torch.Tensor, torch.Tensor, torch.Tensor, ActorCritic], torch.distributions.Categorical], 
         controller,
         ppo: PPO,
         init_position: dict[str, float], 
@@ -410,7 +410,7 @@ def inference(
             actions_seq.append(torch.randint(0, NUM_ACTIONS, (1, 1)).item())
         
         actions_tensor = torch.tensor(actions_seq, dtype=torch.long, device=DEVICE).unsqueeze(0)
-        dist = get_distribution(obs_seq, actions_tensor, actor_critic)
+        dist = get_distribution(ppo, obs_seq, actions_tensor, actor_critic)
         action_idx = dist.sample()
         logp = dist.log_prob(action_idx)
         
@@ -445,7 +445,7 @@ def inference(
     return raw_obs
 
 def inference_video_mp4(
-    get_distribution: Callable[[PPO, torch.Tensor, torch.Tensor, ActorCritic], torch.distributions.Categorical],
+    get_distribution: Callable[[PPO, torch.Tensor, torch.Tensor, torch.Tensor, ActorCritic], torch.distributions.Categorical],
     controller,
     ppo: PPO,
     init_position: dict[str, float],
@@ -493,7 +493,7 @@ def inference_video_mp4(
             actions_seq, dtype=torch.long, device=DEVICE
         ).unsqueeze(0)
 
-        dist = get_distribution(obs_seq, actions_tensor, actor_critic)
+        dist = get_distribution(ppo, obs_seq, actions_tensor, actor_critic)
         action_idx = dist.sample().item()
 
         # ---- Step env ----
