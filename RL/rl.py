@@ -185,6 +185,57 @@ class SegmentationNovelty(Novelty):
         self.running_reward = 0.0
 
 
+class SegmentationSizeNovelty(Novelty):
+    """
+    Novelty reward based on discovering new segmentation instance IDs,
+    but only if they occupy >= min_pixels on screen.
+    """
+    def __init__(
+        self,
+        device=DEVICE,
+        tau=0.95,
+        min_pixels=200,      # NEW: minimum area threshold
+    ):
+        self.device = device
+        self.buffer = set()
+        self.tau = tau
+        self.running_reward = 0.0
+        self.min_pixels = min_pixels
+
+    @torch.no_grad()
+    def compute_reward(self, event):
+        # segmentation mask (H,W) or flattened (H*W)
+        seg = event.instance_segmentation_frame.reshape(-1)
+
+        # count pixels for each instance ID
+        unique_ids, counts = np.unique(seg, return_counts=True)
+
+        # apply size threshold
+        large_enough = {i for i, c in zip(unique_ids, counts) if c >= self.min_pixels}
+
+        # initial case: nothing in buffer yet
+        if len(self.buffer) == 0:
+            self.buffer = large_enough
+            return 0.0
+
+        # compute novelty only for big-enough instances
+        new_ids = large_enough - self.buffer
+        reward_raw = len(new_ids)
+
+        # EMA smoothing
+        self.running_reward = (
+            self.tau * self.running_reward + (1 - self.tau) * reward_raw
+        )
+        reward = reward_raw - self.running_reward
+
+        # update buffer
+        self.buffer |= large_enough
+        return reward
+
+    def reset(self):
+        self.buffer.clear()
+        self.running_reward = 0.0
+
 class Env(ABC):
     @abstractmethod
     def step_env(self, controller, action_idx):
