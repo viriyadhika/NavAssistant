@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 import matplotlib.pyplot as plt
 import imageio
 from typing import Callable
+import wandb
 
 class RolloutBuffer:
     def __init__(self):
@@ -66,7 +67,17 @@ def load_actor_critic(actor_critic, path="actor_critic_checkpoint.pt", device="c
     print(f"[🔁] Actor-Critic checkpoint loaded from {path}")
 
 
-class CLIPNovelty:
+class Novelty(ABC):
+    @abstractmethod
+    def compute_reward(self, event):
+        pass
+
+    @abstractmethod
+    def reset(self):
+        pass
+
+
+class CLIPNovelty(Novelty):
     """
     Intrinsic reward based on CLIP embedding novelty.
     Computes reward = β * (1 - mean(top-k cosine similarity))
@@ -89,12 +100,12 @@ class CLIPNovelty:
         self.running_reward = 0.0  # EMA baseline
 
     @torch.no_grad()
-    def compute_reward(self, frame_np):
+    def compute_reward(self, event):
         """
         frame_np : np.ndarray (H,W,3) uint8
         returns : float intrinsic reward
         """
-        img = Image.fromarray(frame_np)
+        img = Image.fromarray(event.frame)
         img_t = self.preprocess(img).unsqueeze(0).to(self.device)
 
         # 1) Encode and normalize embedding
@@ -129,6 +140,51 @@ class CLIPNovelty:
         self.running_reward = 0.0
 
 
+class SegmentationNovelty(Novelty):
+    """
+    Intrinsic reward based on CLIP embedding novelty.
+    Computes reward = β * (1 - mean(top-k cosine similarity))
+    with exponential smoothing for stability.
+    """
+    def __init__(
+        self,
+        device=DEVICE,
+        tau=0.95,         # smoothing factor
+    ):
+        self.device = device
+        self.buffer = set()
+        self.tau = tau
+        self.running_reward = 0.0  # EMA baseline
+
+    @torch.no_grad()
+    def compute_reward(self, event):
+        """
+        frame_np : np.ndarray (H,W,3) uint8
+        returns : float intrinsic reward
+        """
+        img = event.instance_segmentation_frame.reshape(-1)
+        img_set = set(img)
+        if len(self.buffer) == 0:
+            self.buffer = img_set
+            return 0
+        
+        new_things = len(img_set - self.buffer)
+
+        # # 5) Smooth reward with EMA to reduce noise
+        reward_raw = new_things
+        self.running_reward = self.tau * self.running_reward + (1 - self.tau) * reward_raw
+        reward = reward_raw - self.running_reward   # "relative novelty"
+
+        # # 6) Update buffer
+        self.buffer = self.buffer.union(img_set)
+
+        return reward
+
+    def reset(self):
+        self.buffer.clear()
+        self.running_reward = 0.0
+
+
 class Env(ABC):
     @abstractmethod
     def step_env(self, controller, action_idx):
@@ -139,7 +195,7 @@ class Env(ABC):
         pass
 
 class ClipEnv(Env):
-    def __init__(self, clip_novelty: CLIPNovelty):
+    def __init__(self, clip_novelty: Novelty):
         super().__init__()
         self.clip_novelty = clip_novelty
         self.positions = deque(maxlen=16)
@@ -148,7 +204,7 @@ class ClipEnv(Env):
         action_str = ACTIONS[action_idx]
         event = controller.step(action_str)
     
-        reward = self.clip_novelty.compute_reward(event.frame)
+        reward = self.clip_novelty.compute_reward(event)
         pos = np.array([event.metadata["agent"]["position"]["x"], event.metadata["agent"]["position"]["z"]])
         self.positions.append(pos)
         avg_pos = np.mean(np.stack(self.positions), axis=0)
@@ -378,6 +434,72 @@ def teleport(controller, target=None):
 
     return event
 
+
+def train(controller, name: str, ppo: PPO, env: Env, actor_critic: ActorCritic, total_updates=10):
+    run = wandb.init(
+        reinit="finish_previous",
+        entity="viriyadhika1",
+        project="cv-final-project",
+        name=name,
+        config={},
+    )
+    try:
+        event = controller.step("Pass")  # prime
+        rewards = []
+        episode_rewards = []
+        for upd in range(total_updates):
+            buf = RolloutBuffer()
+            for mb in range(MINIBATCHES):
+                # collect episodes
+                episode_seq = []
+                episode_reward = 0
+                actions_seq = []
+                for t in range(1, EPISODE_STEPS + 1):
+                    with torch.no_grad():
+                        obs_t = ppo.obs_from_event(event)  # (C,H,W)
+                        obs_t_encoded = actor_critic.actor_critic_encoder(obs_t.unsqueeze(0).unsqueeze(0)).squeeze(0).squeeze(0)
+                        obs_seq = torch.stack(episode_seq + [obs_t_encoded], dim=0).unsqueeze(0).to(device=DEVICE)
+
+                    if len(actions_seq) == 0:
+                        actions_seq.append(torch.randint(0, NUM_ACTIONS, (1, 1)).item())
+
+                    actions_tensor = torch.tensor(actions_seq, dtype=torch.long, device=DEVICE).unsqueeze(0)
+                    logits, value = ppo.act_and_value(obs_seq, actions_tensor, actor_critic)
+                    dist = torch.distributions.Categorical(logits=logits)
+                    action_idx = dist.sample()
+                    logp = dist.log_prob(action_idx)
+
+                    action_idx, logp = action_idx.item(), logp.item()
+                    event, reward = env.step_env(controller, action_idx)
+                    done = t == EPISODE_STEPS
+
+                    # store one step
+                    buf.add(obs_t_encoded, action_idx, logp, reward, value, done)
+                    episode_seq.append(obs_t_encoded)
+                    actions_seq.append(action_idx)
+
+                    wandb.log({ "reward": reward })
+
+                    episode_reward += reward / EPISODE_STEPS
+
+                    # 50% chance of teleport
+                    if done:
+                        env.reset()
+                        if np.random.rand() > 0.5:
+                            event = teleport(controller)
+
+                wandb.log({ "episode_reward": episode_reward })
+
+            ppo.ppo_update(buf, actor_critic)
+            if (upd + 1) % 10 == 0:
+                save_actor_critic(actor_critic, f"data/{name}_{upd}.pt")
+            save_actor_critic(actor_critic, f"data/{name}.pt")
+
+            print(f"Update {upd+1}/{total_updates} — steps: {len(buf)}")
+    finally:
+        run.finish()
+
+    return buf, rewards, episode_rewards
 
 
 def inference(
