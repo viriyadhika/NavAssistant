@@ -194,7 +194,7 @@ class SegmentationSizeNovelty(Novelty):
         self,
         device=DEVICE,
         tau=0.95,
-        min_pixels=200,      # NEW: minimum area threshold
+        min_pixels=400,      # NEW: minimum area threshold
     ):
         self.device = device
         self.buffer = set()
