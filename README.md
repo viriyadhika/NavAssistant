@@ -1,0 +1,37 @@
+
+# Introduction
+People with visual impairments often require assistance for navigation tasks. One sub-problem we address in this work is enabling a system to identify and locate items in indoor environments. Our scenario simulates a home-based robot that is familiar with its environment and maintains a record of what it has previously observed.
+
+To support this capability, the robot must develop a grounded scene understanding of its surroundings. Reinforcement Learning (RL) is a common approach for learning effective action policies. Modern Vision-Language-Action (VLA) systems typically rely on large language model backbones, while classical methods such as brute-force search, wall-following, and A* pathfinding remain widely used. However, even though algorithms like A* efficiently explore traversable paths, they do not ensure that the agent captures novel or informative visual observations along the way. Intrinsic-motivation approaches—such as Intrinsic Curiosity Modules (ICM) and Random Network Distillation (RND)—address this by rewarding visual exploration.
+
+Motivated by these ideas, we explore a method for selecting actions using only visual cues within a reinforcement-learning framework based on PPO. By leveraging pre-trained visual encoders like CLIP and ResNet, our method benefits from strong semantic representations without requiring large learned models. Despite its small size—only 3.2M trainable parameters in the actor (≈11 MB) — the system demonstrates the ability to learn interesting emergent behaviors in a single indoor scene. With greater computational resources, this direction could be extended toward a more generalizable navigation system capable of adapting to a wide variety of indoor environments.
+
+We evaluate the model based on its ability to locate common household items. To quantify success, we use the Segment Anything Model (SAM) to determine whether the agent’s trajectory passes through regions containing relevant objects. A robust exploration or pathfinding policy should navigate the environment thoroughly enough to encounter these points of interest.
+
+# Methodology
+
+In this experiment, we use the ProcTHOR simulation platform, which provides a Python interface to a Unity-based 3D environment. ProcTHOR is selected because it produces high-quality RGB observations, an important prerequisite for sim-to-real transfer in future navigation systems.
+
+We adopt Proximal Policy Optimization (PPO) as the core reinforcement-learning framework. PPO is a widely used policy-gradient method that stabilizes training by limiting how much the policy is allowed to change at each update through a clipped surrogate objective. This balance between flexibility and stability makes PPO particularly attractive for vision-based navigation tasks, where small policy deviations can lead to compounding errors. In our setup, the state space consists solely of the agent’s first-person visual frame, and the action space contains three discrete movements: MoveRight (30° rotation), MoveLeft (30° rotation), and MoveAhead (0.25 meters).
+
+To promote exploration, we incorporate an intrinsic reward derived from CLIP embedding novelty, supplemented with simple positional-change bonuses and penalties. For each episode, a buffer stores CLIP embeddings of all observed frames. At each time step, we compute the cosine similarity between the current embedding and its top five nearest embeddings in the buffer. The intrinsic reward is defined as 1 - top-k similarity, which we found to produce a sharper novelty signal compared to averaging over all past frames. To further stabilize the intrinsic reward, we maintain a running exponential moving average (EMA) and subtract it from the raw novelty score. These combined signals yield interesting emergent exploration behaviors.
+
+The policy and value networks share a frozen ResNet-18 encoder, followed by a lightweight learnable projection layer. Two separate sliding-window Transformers then process the most recent 32 visual embeddings: one Transformer outputs action logits for the actor, and the other produces value estimates for the critic. A causal mask is applied during training to ensure that decisions at time _t_ are informed only by frames from the past. The overall PPO loss consists of three components: the clipped surrogate policy loss, a value-function regression loss, and an entropy bonus to encourage exploration.
+
+Several design choices were made based on observations from alternative setups and preliminary experiments:
+
+1. **Temporal context (32-frame window).** 
+	The last 32 frames are included on the actor and critic sliding window transformer because the intrinsic reward depends not only on the agent’s current observation but also on the sequence of transitions that led to it. Conditioning both the policy and value functions on recent visual history enables short-horizon planning and allows the model to better interpret the novelty signal in context. However, this window size is ultimately constrained by the Transformer’s memory cost, which scales quadratically with sequence length. Future work may explore architectural alternatives—such as hierarchical memory mechanisms—that could support longer-horizon reasoning without prohibitive computational overhead.
+2. **Choosing CLIP novelty over RND.**  
+    We initially experimented with Random Network Distillation (RND), but found the intrinsic reward to be highly unstable. The critic was unable to approximate this signal accurately, leading to unreliable advantages and degraded policy updates. In contrast, CLIP-based embedding novelty provides a more stable and semantically meaningful intrinsic reward.
+3. **Choosing CLIP over 3D-aware VGGT embeddings.**  
+    We also tested novelty signals derived from 3D-aware VGGT embeddings. However, even visually unrelated simulated scenes produced similarity scores above 0.999, suggesting that the reconstruction-driven embedding space collapses for simulation imagery. This makes VGGT unsuitable for novelty-driven exploration in our setting, whereas CLIP retains much better semantic discrimination.
+4. **Transformer instead of LSTM.**  
+    The original RND paper used LSTMs to model temporal dependencies. In our experiments, LSTMs led to significantly slower training due to sequential computation, and collapsed to predicting nearly uniform action probabilities—likely a symptom of vanishing gradients in long sequences. Transformers, with their parallel attention mechanism, provided better long-range modeling capacity and more stable optimization.
+5. **Hyperparameter tuning.**
+    Hyperparameters were tuned manually based on qualitative understanding of the system. Intrinsic rewards were shaped so that typical values fall within −0.2 to 1.0, preventing scale imbalance during advantage estimation. The entropy coefficient was adjusted empirically to manage the exploration–exploitation tradeoff, based on observed policy behavior during training.
+6. **ResNet-18 as the shared encoder.**
+    We use a frozen ResNet-18 as the backbone for both actor and critic to balance semantic richness with computational efficiency. Training a CNN from scratch yielded poor performance even after many episodes, while using CLIP as the full encoder produced strong representations but significantly slowed inference due to model size. ResNet-18 therefore provides the best trade-off between representational quality and speed for our use case.
+
+# Results and Discussion
+

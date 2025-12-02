@@ -2,3 +2,8 @@
 data
 .DS_Store
 .mypy_cache
+vggt
+.venv_vggt
+.vscode
+__pycache__
+wandb
